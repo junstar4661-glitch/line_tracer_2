@@ -55,3 +55,4 @@
 "./Main/Src/menu.o"
 "./Main/Src/motor.o"
 "./Main/Src/sensor.o"
+"./Main/Src/ui.o"

@@ -11,85 +11,107 @@
 #include "drive.h"
 #include "custom_lcd.h"
 #include "button.h"
+#include "ui.h"
 
 #define MENU_ROWS	4
 
 typedef struct {
-	char name[16];
+	char name[12];
 	void (*func)(void);
 } Menu_TypeDef;
 
 // @formatter:off
 Menu_TypeDef MENU[] = {
 		{ .name = "sensor raw" },
-		{ .name = "calibration" },
-		{ .name = "sensor norm" },
-		{ .name = "sensor state" },
-		{ .name = "motor phase" },
-		{ .name = "motor speed" },
-		{ .name = "first drive" },
-		{ .name = "second drive" },
+		{ .name = "calibrate"  },
+		{ .name = "sen norm"   },
+		{ .name = "sen state"  },
+		{ .name = "mtr phase"  },
+		{ .name = "mtr speed"  },
+		{ .name = "DRIVE 1st"  },
+		{ .name = "DRIVE 2nd"  },
 };
 // @formatter:on
+
+static void Menu_Cell(uint8_t i, int8_t sel) {
+	if (i == (uint8_t) sel)
+		Custom_LCD_Printf(UI_C_ACCENT ">%d %-10s", i + 1, MENU[i].name);
+	else
+		Custom_LCD_Printf(UI_C_LABEL " %d %-10s", i + 1, MENU[i].name);
+}
 
 void Main_Menu() {
 	static uint8_t init_done = 0;
 	static int8_t idx = 0;
+	static int8_t drawnIdx = -1;
+	static uint8_t drawnCal = 0xFF;
+	static uint8_t frameDrawn = 0;
+	static uint32_t lastMoveTime = 0;
 
 	if (!init_done) {
 		Custom_LCD_Init(LCD_TYPE_ST7735);
-		Custom_LCD_Printf("/0/r/AHello world");
-		Custom_LCD_Printf("/1Hello world");
-
-		HAL_Delay(500);
-		Custom_LCD_Clear();
-
+		UI_Banner("LINE TRACER", "ZETIN system up", UI_C_TITLE, 800);
 		init_done = 1;
+		frameDrawn = 0;
 	}
 
 	uint8_t max_menu_size = sizeof(MENU) / sizeof(MENU[0]);
 	UserInput_t btn_input = Button_Get_Input();
 
-	// 왼쪽 칸 = 0~3, 오른쪽 칸 = 4~6
-	for (uint8_t i = 0; i < MENU_ROWS; i++) {
-		uint8_t left = i;
-		uint8_t right = i + MENU_ROWS;
+	if (!frameDrawn) {
+		Custom_LCD_Clear();
+		frameDrawn = 1;
+		drawnIdx = -1;
+		drawnCal = 0xFF;
+	}
 
-		if (left == idx)
-			Custom_LCD_Printf("/r");
+	uint8_t cal = Sensor_Is_Calibrated();
+	if (idx != drawnIdx || cal != drawnCal) {
+		Custom_LCD_Printf("/0" UI_SMALL UI_C_TITLE "%-13s", "LINE TRACER");
+		if (cal)
+			Custom_LCD_Printf(UI_C_OK "%-13s", "CAL OK");
 		else
-			Custom_LCD_Printf("/w");
-		Custom_LCD_Printf("/%d%-13s", i, MENU[left].name);
+			Custom_LCD_Printf(UI_C_BAD "%-13s", "NO CAL");
 
-		if (right < max_menu_size) {
-			if (right == idx)
-				Custom_LCD_Printf("/r");
-			else
-				Custom_LCD_Printf("/w");
-			Custom_LCD_Printf("%-13s", MENU[right].name);
+		for (uint8_t i = 0; i < MENU_ROWS; i++) {
+			uint8_t left = i;
+			uint8_t right = (uint8_t) (i + MENU_ROWS);
+
+			Custom_LCD_Printf("/%d" UI_SMALL, i + 1);
+			Menu_Cell(left, idx);
+			if (right < max_menu_size)
+				Menu_Cell(right, idx);
 		}
+		drawnIdx = idx;
+		drawnCal = cal;
 	}
 
 	if (btn_input != INPUT_CMD_NONE) {
-		Custom_LCD_Printf("/5%2d", btn_input);
-
 		switch (btn_input) {
-		case INPUT_CMD_L_SINGLE:
+		case INPUT_CMD_L_SINGLE: {
+			uint32_t now = HAL_GetTick();
+			if (now - lastMoveTime < 150) break;
+			lastMoveTime = now;
 			idx -= 1;
 			if (idx < 0)
-				idx = max_menu_size - 1;
+				idx = (int8_t) (max_menu_size - 1);
 			break;
+		}
 
-		case INPUT_CMD_R_SINGLE:
+		case INPUT_CMD_R_SINGLE: {
+			uint32_t now = HAL_GetTick();
+			if (now - lastMoveTime < 150) break;
+			lastMoveTime = now;
 			idx += 1;
-			if (idx == max_menu_size)
+			if (idx >= (int8_t) max_menu_size)
 				idx = 0;
 			break;
+		}
 
 		case INPUT_CMD_K_SINGLE:
-			if (idx == 0){
-			Sensor_Test_Raw();
-			}
+			frameDrawn = 0;
+			if (idx == 0)
+				Sensor_Test_Raw();
 			else if (idx == 1)
 				Sensor_Calibration();
 			else if (idx == 2)
@@ -105,6 +127,7 @@ void Main_Menu() {
 			else if (idx == 7)
 				Drive_Second();
 			break;
+
 		default:
 			break;
 		}

@@ -1,5 +1,5 @@
 /*
- * sensor.c
+ * sensor.c  — IR_Index 되돌림 테스트용
  *
  *  Created on: 2026. 6. 24.
  *      Author: kth59
@@ -14,6 +14,7 @@
 #include "custom_lcd.h"
 #include "menu.h"
 #include "button.h"
+#include "ui.h"
 
 #define SENSOR_NUM 8
 #define TIM_IR 		&htim6
@@ -43,12 +44,17 @@ volatile IR_DATA irData;
 // 1 = 흰색일 때 raw가 더 크다, 0 = 검정일 때 raw가 더 크다 (캘리브레이션이 자동 판별)
 volatile uint8_t whiteIsHigh = 1;
 
-IR_TypeDef IR_Index[SENSOR_NUM] = { { .Port = IR_0_GPIO_Port, .Pin = IR_0_Pin },
-		{ .Port = IR_1_GPIO_Port, .Pin = IR_1_Pin }, { .Port = IR_2_GPIO_Port,
-				.Pin = IR_2_Pin }, { .Port = IR_3_GPIO_Port, .Pin = IR_3_Pin },
-		{ .Port = IR_3_GPIO_Port, .Pin = IR_3_Pin }, { .Port = IR_2_GPIO_Port,
-				.Pin = IR_2_Pin }, { .Port = IR_1_GPIO_Port, .Pin = IR_1_Pin },
-		{ .Port = IR_0_GPIO_Port, .Pin = IR_0_Pin }, };
+/* ★ 되돌림: 뒷절반을 앞절반 거울복사 (예전 상태) */
+IR_TypeDef IR_Index[SENSOR_NUM] = {
+		{ .Port = IR_0_GPIO_Port, .Pin = IR_0_Pin },
+		{ .Port = IR_1_GPIO_Port, .Pin = IR_1_Pin },
+		{ .Port = IR_2_GPIO_Port, .Pin = IR_2_Pin },
+		{ .Port = IR_3_GPIO_Port, .Pin = IR_3_Pin },
+		{ .Port = IR_3_GPIO_Port, .Pin = IR_3_Pin },
+		{ .Port = IR_2_GPIO_Port, .Pin = IR_2_Pin },
+		{ .Port = IR_1_GPIO_Port, .Pin = IR_1_Pin },
+		{ .Port = IR_0_GPIO_Port, .Pin = IR_0_Pin },
+};
 
 volatile uint32_t tim6_cnt = 0;
 volatile uint32_t adc_cnt = 0;
@@ -63,6 +69,7 @@ const float sensorLinePosMm[8] = {
 };
 
 volatile int32_t linePosition = 0;
+volatile uint8_t lineFound = 0;
 
 // ---- 마크 인식 FSM ----
 typedef enum { MARK_IDLE, MARK_ACCUM } MarkFsmState_t;
@@ -154,63 +161,88 @@ void Sensor_Start() {
 void Sensor_Stop() {
 	HAL_TIM_Base_Stop_IT(TIM_IR);
 	HAL_ADC_Stop_IT(ADC_SENSOR);
+	for (uint8_t i = 0; i < SENSOR_NUM; i++)
+		IR_Disable(i);
+}
+
+uint8_t Sensor_Is_Calibrated() {
+	for (uint8_t i = 0; i < SENSOR_NUM; i++) {
+		if (irData.sensorWhiteMax[i] != irData.sensorBlackMax[i])
+			return 1;
+	}
+	return 0;
+}
+
+uint8_t Sensor_Line_Found() {
+	return lineFound;
 }
 
 void Sensor_Calibration() {
 	UserInput_t btn_input;
-	uint8_t i, stage = 0;   // 0: BLACK(바탕), 1: WHITE(선), 2: DONE
+	uint8_t i, stage = 0;
 	uint8_t bMin[SENSOR_NUM], bMax[SENSOR_NUM];
 	uint8_t wMin[SENSOR_NUM], wMax[SENSOR_NUM];
 	uint16_t bSum = 0, wSum = 0;
+	uint32_t lastDraw = 0;
+	uint8_t drawnStage = 0xFF;
 
 	Sensor_Start();
 	Custom_LCD_Clear();
+
 	for (i = 0; i < SENSOR_NUM; i++) {
-		bMin[i] = 255;
-		bMax[i] = 0;
-		wMin[i] = 255;
-		wMax[i] = 0;
+		bMin[i] = 255; bMax[i] = 0; wMin[i] = 255; wMax[i] = 0;
 	}
-	Custom_LCD_Printf("BLACK - HOLD:next");
-	HAL_Delay(1000);
 
 	while (1) {
 		btn_input = Button_Get_Input();
+		uint32_t now = HAL_GetTick();
 		uint8_t *pMin = (stage == 0) ? bMin : wMin;
 		uint8_t *pMax = (stage == 0) ? bMax : wMax;
 
 		for (i = 0; i < SENSOR_NUM; i++) {
 			uint8_t r = irData.sensorRaw[i];
-			if (r < pMin[i])
-				pMin[i] = r;
-			if (r > pMax[i])
-				pMax[i] = r;
+			if (r < pMin[i]) pMin[i] = r;
+			if (r > pMax[i]) pMax[i] = r;
 		}
-		for (i = 0; i < 2; i++) {
-			Custom_LCD_Printf("/%d %-4d%-4d%-4d%-4d", i, pMax[4 * i],
-					pMax[4 * i + 1], pMax[4 * i + 2], pMax[4 * i + 3]);
+
+		if (stage != drawnStage) {
+			Custom_LCD_Printf("/0" UI_SMALL UI_C_TITLE "%-9s", "CAL");
+			if (stage == 0)
+				Custom_LCD_Printf(UI_C_LABEL "STEP1 " UI_C_VALUE "%-11s", "BLACK");
+			else
+				Custom_LCD_Printf(UI_C_LABEL "STEP2 " UI_C_ACCENT "%-11s", "WHITE");
+			drawnStage = stage;
+		}
+
+		if ((now - lastDraw) >= 80) {
+			lastDraw = now;
+			for (i = 0; i < 4; i++) {
+				Custom_LCD_Printf("/%d" UI_SMALL, i + 1);
+				Custom_LCD_Printf(UI_C_LABEL "%d ", i);
+				UI_Bar(pMax[i], 255, 5, UI_C_TITLE);
+				Custom_LCD_Printf(UI_C_VALUE "%3d ", pMax[i]);
+				Custom_LCD_Printf(UI_C_LABEL "%d ", i + 4);
+				UI_Bar(pMax[i + 4], 255, 5, UI_C_TITLE);
+				Custom_LCD_Printf(UI_C_VALUE "%3d", pMax[i + 4]);
+			}
 		}
 
 		if (btn_input == INPUT_CMD_K_HOLD) {
 			stage++;
 			if (stage == 1) {
-				Custom_LCD_Clear();
-				Custom_LCD_Printf("WHITE - HOLD:next");
-				HAL_Delay(1000);
+				HAL_Delay(600);
 			} else {
 				break;
 			}
 		}
 	}
 
-	// 흑/백 중 어느 쪽 raw가 큰지 자동 판별
 	for (i = 0; i < SENSOR_NUM; i++) {
 		bSum += bMax[i];
 		wSum += wMax[i];
 	}
 	whiteIsHigh = (wSum > bSum) ? 1 : 0;
 
-	// 센서별 양 끝점 저장
 	for (i = 0; i < SENSOR_NUM; i++) {
 		uint8_t lo = (bMin[i] < wMin[i]) ? bMin[i] : wMin[i];
 		uint8_t hi = (bMax[i] > wMax[i]) ? bMax[i] : wMax[i];
@@ -226,22 +258,36 @@ void Sensor_Calibration() {
 	irData.sensorThreshold = 50;
 
 	Sensor_Stop();
-	Custom_LCD_Clear();
-	Custom_LCD_Printf("/0CAL DONE thr%d", irData.sensorThreshold);
-	Custom_LCD_Printf("/1whiteHigh %d", whiteIsHigh);
+	UI_Banner("CAL DONE", NULL, UI_C_OK, 0);
+	Custom_LCD_Printf("/2" UI_SMALL UI_C_LABEL "thr       " UI_C_VALUE "%-14d", irData.sensorThreshold);
+	Custom_LCD_Printf("/3" UI_SMALL UI_C_LABEL "whiteHigh " UI_C_VALUE "%-14d", whiteIsHigh);
 	HAL_Delay(1500);
 	Main_Menu();
 }
 
+
 void Sensor_Test_Raw() {
+	uint32_t lastDraw = 0;
+
 	Sensor_Start();
 	Custom_LCD_Clear();
+	Custom_LCD_Printf("/0" UI_SMALL UI_C_TITLE "%-26s", "SENSOR RAW");
+
 	while (1) {
 		UserInput_t btn_input = Button_Get_Input();
-		for (int i = 0; i < 2; i++) {
-			Custom_LCD_Printf("/%d %-4d%-4d%-4d%-4d", i,
-					irData.sensorRaw[4 * i], irData.sensorRaw[4 * i + 1],
-					irData.sensorRaw[4 * i + 2], irData.sensorRaw[4 * i + 3]);
+		uint32_t now = HAL_GetTick();
+
+		if ((now - lastDraw) >= 80) {
+			lastDraw = now;
+			for (uint8_t i = 0; i < 4; i++) {
+				Custom_LCD_Printf("/%d" UI_SMALL, i + 1);
+				Custom_LCD_Printf(UI_C_LABEL "%d ", i);
+				UI_Bar(irData.sensorRaw[i], 255, 5, UI_C_TITLE);
+				Custom_LCD_Printf(UI_C_VALUE "%3d ", irData.sensorRaw[i]);
+				Custom_LCD_Printf(UI_C_LABEL "%d ", i + 4);
+				UI_Bar(irData.sensorRaw[i + 4], 255, 5, UI_C_TITLE);
+				Custom_LCD_Printf(UI_C_VALUE "%3d", irData.sensorRaw[i + 4]);
+			}
 		}
 
 		if (btn_input == INPUT_CMD_K_HOLD) {
@@ -251,18 +297,33 @@ void Sensor_Test_Raw() {
 		}
 	}
 }
+
 
 void Sensor_Test_Normalized() {
+	uint32_t lastDraw = 0;
+
 	Sensor_Start();
 	Custom_LCD_Clear();
+	Custom_LCD_Printf("/0" UI_SMALL UI_C_TITLE "%-26s", "SENSOR NORM");
+
 	while (1) {
 		UserInput_t btn_input = Button_Get_Input();
-		for (int i = 0; i < 2; i++) {
-			Custom_LCD_Printf("/%d %-4d%-4d%-4d%-4d", i,
-					irData.sensorNormalized[4 * i],
-					irData.sensorNormalized[4 * i + 1],
-					irData.sensorNormalized[4 * i + 2],
-					irData.sensorNormalized[4 * i + 3]);
+		uint32_t now = HAL_GetTick();
+
+		if ((now - lastDraw) >= 80) {
+			lastDraw = now;
+			for (uint8_t i = 0; i < 4; i++) {
+				uint8_t a = irData.sensorNormalized[i];
+				uint8_t b = irData.sensorNormalized[i + 4];
+
+				Custom_LCD_Printf("/%d" UI_SMALL, i + 1);
+				Custom_LCD_Printf(UI_C_LABEL "%d ", i);
+				UI_Bar(a, 100, 5, (a >= irData.sensorThreshold) ? UI_C_OK : UI_C_TITLE);
+				Custom_LCD_Printf(UI_C_VALUE "%3d ", a);
+				Custom_LCD_Printf(UI_C_LABEL "%d ", i + 4);
+				UI_Bar(b, 100, 5, (b >= irData.sensorThreshold) ? UI_C_OK : UI_C_TITLE);
+				Custom_LCD_Printf(UI_C_VALUE "%3d", b);
+			}
 		}
 
 		if (btn_input == INPUT_CMD_K_HOLD) {
@@ -272,21 +333,30 @@ void Sensor_Test_Normalized() {
 		}
 	}
 }
+
 
 int32_t Sensor_Get_Position() {
 	int32_t sum_pw = 0;
 	int32_t sum_w = 0;
 
 	for (uint8_t i = 1; i <= 6; i++) {
-		int32_t w = (int32_t) irData.sensorNormalized[i];
+		int32_t n = (int32_t) irData.sensorNormalized[i];
+		/* 가중치는 항상 "흰색(라인)일수록 크다"로 통일한다.
+		 * norm은 raw가 클수록 100이므로 whiteIsHigh==0이면 뒤집어야 한다 */
+		int32_t w = whiteIsHigh ? n : (100 - n);
+
 		if (w < 15)
 			w = 0;
 		sum_pw += (int32_t) (sensorLinePosMm[i] * 100) * w;
 		sum_w += w;
 	}
 
-	if (sum_w > 0)
+	if (sum_w > 0) {
 		linePosition = sum_pw / sum_w;
+		lineFound = 1;
+	} else {
+		lineFound = 0;   // 직전 linePosition 유지 (마지막 방향으로 계속 꺾음)
+	}
 
 	return linePosition;
 }
@@ -314,9 +384,9 @@ void Mark_FSM_Tick() {
 			else if ((markAccum & 0x81) == 0x81)
 				markLastType = MARKTYPE_END;
 			else if ((markAccum & 0x81) == 0x80)
-				markLastType = MARKTYPE_LEFT;
+				markLastType = MARKTYPE_RIGHT;  /* bit7 = 오른쪽 끝 센서 */
 			else
-				markLastType = MARKTYPE_RIGHT;
+				markLastType = MARKTYPE_LEFT;   /* bit0 = 왼쪽 끝 센서 */
 
 			markLastResult = 1;
 			markFsmState = MARK_IDLE;
@@ -326,33 +396,57 @@ void Mark_FSM_Tick() {
 }
 
 void Sensor_Test_State() {
+	uint32_t lastDraw = 0;
+	uint32_t markShownAt = 0;
+
 	Sensor_Start();
 	Custom_LCD_Clear();
+
 	while (1) {
 		UserInput_t btn_input = Button_Get_Input();
-
-		uint8_t st = irData.sensorState;
-		char bits[SENSOR_NUM + 1];
-		uint8_t cnt = 0;
-
-		for (int i = 0; i < SENSOR_NUM; i++) {
-			if (st & (1u << i)) {
-				bits[i] = '1';
-				cnt++;
-			} else {
-				bits[i] = '0';
-			}
-		}
-		bits[SENSOR_NUM] = '\0';
-
-		Custom_LCD_Printf("/0W %-8s", bits);
-		Custom_LCD_Printf("/1thr%-4dn%-3d", irData.sensorThreshold, cnt);
-		Custom_LCD_Printf("/2p %-8d", (int) Sensor_Get_Position());
+		uint32_t now = HAL_GetTick();
 
 		Mark_FSM_Tick();
 		if (markLastResult) {
-			const char *names[] = {"LEFT", "RIGHT", "END", "CROSS"};
-			Custom_LCD_Printf("/3MARK:%-6s", names[markLastType]);
+			const char *names[] = { "LEFT", "RIGHT", "END", "CROSS" };
+			const char *col = (markLastType == MARKTYPE_END) ? UI_C_BAD : UI_C_ACCENT;
+			Custom_LCD_Printf("/4" UI_SMALL UI_C_LABEL "MARK ");
+			Custom_LCD_Printf("%s%-20s", col, names[markLastType]);
+			markShownAt = now;
+		} else if (markShownAt && (now - markShownAt) > 1200) {
+			Custom_LCD_Printf("/4" UI_SMALL UI_C_LABEL "MARK " UI_C_DIM "%-20s", "-");
+			markShownAt = 0;
+		}
+
+		if ((now - lastDraw) >= 80) {
+			lastDraw = now;
+
+			uint8_t st = irData.sensorState;
+			uint8_t cnt = 0;
+			for (uint8_t i = 0; i < SENSOR_NUM; i++)
+				if (st & (1u << i))
+					cnt++;
+
+			int32_t p = Sensor_Get_Position();
+
+			Custom_LCD_Printf("/0" UI_SMALL UI_C_TITLE "%-13s", "SEN STATE");
+			if (Sensor_Line_Found())
+				Custom_LCD_Printf(UI_C_OK "%-13s", "ON TRACK");
+			else
+				Custom_LCD_Printf(UI_C_BAD "%-13s", "LOST");
+
+			Custom_LCD_Printf("/1" UI_SMALL UI_C_LABEL "W ");
+			UI_Bits(st, SENSOR_NUM);
+			Custom_LCD_Printf("        ");
+
+			Custom_LCD_Printf("/2" UI_SMALL UI_C_LABEL "p");
+			Custom_LCD_Printf(UI_C_VALUE "%+6ld ", (long) p);
+			UI_CenterBar(p, 3700, 18);
+
+			Custom_LCD_Printf("/3" UI_SMALL UI_C_LABEL "n ");
+			Custom_LCD_Printf(UI_C_VALUE "%d", cnt);
+			Custom_LCD_Printf(UI_C_LABEL "   thr ");
+			Custom_LCD_Printf(UI_C_VALUE "%-3d      ", irData.sensorThreshold);
 		}
 
 		if (btn_input == INPUT_CMD_K_HOLD) {

@@ -14,6 +14,7 @@
 #include "button.h"
 #include "menu.h"
 #include "dac.h"
+#include "ui.h"
 
 #define TREAD_MM         177.0f
 #define WHEEL_DIA_MM      65.0f
@@ -21,15 +22,11 @@
 #define STEPS_PER_REV    ((360.0f / STEP_ANGLE_DEG) * 2.0f)   // 하프스텝 8상 → 회전당 400스텝
 #define MM_PER_STEP      ((WHEEL_DIA_MM * 3.14159f) / STEPS_PER_REV)
 
-// b1~b6 = 주행선 센서 (수직/Y축 거리, mm), 왼쪽 -, 오른쪽 +
-// b0, b7 = 마커 전용 (line position 계산엔 미사용)
-const float sensorPositionMm[8] =
-{
-    0,     // b0 마커 (미사용)
-   -37, -23, -8,   // b1, b2, b3 (왼쪽)
-   +8, +23, +37,   // b4, b5, b6 (오른쪽)
-    0      // b7 마커 (미사용)
-};
+/* ★ 전진 방향 보정. 좌우 모터가 마주보게 달려서 한쪽은 뒤집어야 한다.
+ *   제자리 회전 → 한쪽만 -1  /  후진 → 양쪽 다 -1  /  정상 → 양쪽 다 +1 */
+#define MOTOR_L_DIR_SIGN   (-1)
+#define MOTOR_R_DIR_SIGN   (+1)
+
 #define TIM_MOTOR_L &htim1
 #define TIM_MOTOR_R &htim8
 
@@ -46,7 +43,8 @@ const float sensorPositionMm[8] =
 #define RAMP_ACCEL_MM_S2   1000.0f      // 목표 가속도. 안 돌면 조금씩 올려라
 #define RAMP_ACCEL         (RAMP_ACCEL_MM_S2 / RAMP_TICK_HZ)
 
-#define MOTOR_DAC_REF      1600         // 약 0.97V (VREF 절대최대 2.0V의 절반 이하)
+/* 1200/4095*3.3 = 0.967V. 스텝 놓치면 여기만 100씩 올려라 */
+#define MOTOR_DAC_REF      1200
 #define MOTOR_RUN_TIMEOUT_MS  10000     // RUN 자동 차단 (안전장치)
 
 
@@ -81,7 +79,6 @@ volatile int32_t stepCountR = 0;
 volatile float vTargetL = 0, vTargetR = 0;   // 목표 속도 (mm/s)
 volatile float vCurL = 0, vCurR = 0;         // 현재 속도 (mm/s)
 volatile uint32_t ramp_tick_count = 0;
-volatile uint32_t vector_hit_count = 0;
 
 void MOTOR_L_IRQ_Handler() {
 	static uint8_t index = 0;
@@ -91,7 +88,8 @@ void MOTOR_L_IRQ_Handler() {
 	HAL_GPIO_WritePin((Motor_L + 2)->Port, (Motor_L + 2)->Pin, Check_Bit(outBit, 0x4));
 	HAL_GPIO_WritePin((Motor_L + 3)->Port, (Motor_L + 3)->Pin, Check_Bit(outBit, 0x8));
 	index = (uint8_t) ((index + motorDirL) & 0x7);
-	stepCountL += motorDirL;
+	/* 거리는 "전진 = +" 기준으로 쌓는다. 전기적 방향과 분리 */
+	stepCountL += (int32_t) (motorDirL * MOTOR_L_DIR_SIGN);
 }
 
 void MOTOR_R_IRQ_Handler() {
@@ -102,7 +100,7 @@ void MOTOR_R_IRQ_Handler() {
 	HAL_GPIO_WritePin((Motor_R + 2)->Port, (Motor_R + 2)->Pin, Check_Bit(outBit, 0x4));
 	HAL_GPIO_WritePin((Motor_R + 3)->Port, (Motor_R + 3)->Pin, Check_Bit(outBit, 0x8));
 	index = (uint8_t) ((index + motorDirR) & 0x7);
-	stepCountR += motorDirR;
+	stepCountR += (int32_t) (motorDirR * MOTOR_R_DIR_SIGN);
 }
 
 void DAC_Pin_Force_Analog(void) {
@@ -138,6 +136,7 @@ void Motor_Timer_Force_Prescaler(void) {
 	(TIM_MOTOR_L)->Instance->EGR = TIM_EGR_UG;
 	(TIM_MOTOR_R)->Instance->EGR = TIM_EGR_UG;
 }
+
 void Motor_Start_L() {
 	HAL_TIM_Base_Start_IT(TIM_MOTOR_L);
 }
@@ -159,8 +158,12 @@ void Motor_Start() {
 	HAL_DAC_Start(&hdac1, DAC_CHANNEL_2);
 	HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_2, DAC_ALIGN_12B_R, MOTOR_DAC_REF);
 
-	Motor_Start_L();
-	Motor_Start_R();
+	Motor_Timer_Force_Prescaler();
+
+	/* 타이머는 여기서 켜지 않는다. 속도가 생기면 Velocity_To_ARR_*가 켠다 */
+	Motor_Stop_L();
+	Motor_Stop_R();
+	Motor_Coil_Off();
 }
 
 void Motor_Stop() {
@@ -217,12 +220,11 @@ void Velocity_To_ARR_L(float v_mm_s) {
 		Motor_Coil_Off_L();
 		return;
 	}
-	Motor_Set_Dir_L(v_mm_s >= 0 ? 1 : -1);
+	/* 주행 방향(+ = 전진)에 장착 보정 부호를 곱해 전기적 방향으로 변환 */
+	Motor_Set_Dir_L((int8_t) ((v_mm_s >= 0 ? 1 : -1) * MOTOR_L_DIR_SIGN));
 
 	float f_step = fabsf(v_mm_s) / MM_PER_STEP;
-	uint32_t arr = (uint32_t)((TIM_CLK_HZ / f_step) - 1);
-	if (arr < MOTOR_ARR_MIN) arr = MOTOR_ARR_MIN;
-	if (arr > MOTOR_ARR_MAX) arr = MOTOR_ARR_MAX;
+	uint32_t arr = Motor_Clamp((uint32_t) ((TIM_CLK_HZ / f_step) - 1));
 
 	Motor_Set_ARR_L((uint16_t) arr);
 	Motor_Start_L();
@@ -234,12 +236,10 @@ void Velocity_To_ARR_R(float v_mm_s) {
 		Motor_Coil_Off_R();
 		return;
 	}
-	Motor_Set_Dir_R(v_mm_s >= 0 ? 1 : -1);
+	Motor_Set_Dir_R((int8_t) ((v_mm_s >= 0 ? 1 : -1) * MOTOR_R_DIR_SIGN));
 
 	float f_step = fabsf(v_mm_s) / MM_PER_STEP;
-	uint32_t arr = (uint32_t)((TIM_CLK_HZ / f_step) - 1);
-	if (arr < MOTOR_ARR_MIN) arr = MOTOR_ARR_MIN;
-	if (arr > MOTOR_ARR_MAX) arr = MOTOR_ARR_MAX;
+	uint32_t arr = Motor_Clamp((uint32_t) ((TIM_CLK_HZ / f_step) - 1));
 
 	Motor_Set_ARR_R((uint16_t) arr);
 	Motor_Start_R();
@@ -248,6 +248,13 @@ void Velocity_To_ARR_R(float v_mm_s) {
 void Ramp_Set_Target(float vL, float vR) {
 	vTargetL = vL;
 	vTargetR = vR;
+}
+
+void Ramp_Reset() {
+	vTargetL = 0;
+	vTargetR = 0;
+	vCurL = 0;
+	vCurR = 0;
 }
 
 volatile HAL_StatusTypeDef ramp_start_result;
@@ -285,6 +292,7 @@ void Motor_Test() {
 	int8_t dirL = 1, dirR = 1;
 	uint32_t lastAct = 0;
 	uint32_t runStartTime = 0;
+	uint32_t lastDraw = 0;
 
 	DAC_Pin_Force_Analog();
 	HAL_DAC_Start(&hdac1, DAC_CHANNEL_2);
@@ -292,7 +300,7 @@ void Motor_Test() {
 
 	Motor_Timer_Force_Prescaler();
 
-	Ramp_Set_Target(0, 0);
+	Ramp_Reset();
 	Ramp_Start();
 	Motor_Coil_Off();
 	Custom_LCD_Clear();
@@ -337,10 +345,34 @@ void Motor_Test() {
 		else
 			Ramp_Set_Target(0, 0);
 
-		Custom_LCD_Printf("/0p%-5lu", (unsigned long) (TIM_MOTOR_L)->Instance->PSC);
-		Custom_LCD_Printf("/1a%-8lu", (unsigned long) (TIM_MOTOR_L)->Instance->ARR);
-		Custom_LCD_Printf("/2v%-4d s%-4d", (int) vCurL, (int) spdL);
-		Custom_LCD_Printf("/3%-4s", running ? "RUN" : "OFF");
+		if ((now - lastDraw) >= 80) {
+			lastDraw = now;
+			const char *tname = (target == 0) ? "BOTH" : (target == 1) ? "L" : "R";
+
+			Custom_LCD_Printf("/0" UI_SMALL UI_C_TITLE "%-9s", "MTR SPD");
+			if (running)
+				Custom_LCD_Printf(UI_C_OK "RUN " UI_C_LABEL "%-7s", tname);
+			else
+				Custom_LCD_Printf(UI_C_DIM "OFF " UI_C_LABEL "%-7s", tname);
+
+			Custom_LCD_Printf("/1" UI_SMALL UI_C_LABEL "set L ");
+			Custom_LCD_Printf(UI_C_VALUE "%-4d", (int) spdL);
+			Custom_LCD_Printf(UI_C_LABEL " R ");
+			Custom_LCD_Printf(UI_C_VALUE "%-4d   ", (int) spdR);
+
+			Custom_LCD_Printf("/2" UI_SMALL UI_C_LABEL "dir L ");
+			Custom_LCD_Printf("%s%-4s", (dirL > 0) ? UI_C_OK : UI_C_WARN, (dirL > 0) ? "FWD" : "REV");
+			Custom_LCD_Printf(UI_C_LABEL " R ");
+			Custom_LCD_Printf("%s%-4s   ", (dirR > 0) ? UI_C_OK : UI_C_WARN, (dirR > 0) ? "FWD" : "REV");
+
+			Custom_LCD_Printf("/3" UI_SMALL UI_C_LABEL "now ");
+			Custom_LCD_Printf(UI_C_VALUE "%-5d", (int) vCurL);
+			Custom_LCD_Printf(UI_C_LABEL "mm/s     ");
+
+			Custom_LCD_Printf("/4" UI_SMALL);
+			UI_Bar((uint8_t) (fabsf(vCurL) > 500 ? 500 : fabsf(vCurL)), 200, 24,
+					running ? UI_C_OK : UI_C_DIM);
+		}
 
 		if (btn_input == INPUT_CMD_K_HOLD) {
 			break;
@@ -359,6 +391,7 @@ void Motor_Phase_Test() {
 	static uint8_t idxL = 0;
 	static uint8_t idxR = 0;
 	uint32_t lastInputTime = 0;
+	uint32_t lastDraw = 0;
 	uint8_t coilOn = 0;
 
 	DAC_Pin_Force_Analog();
@@ -413,12 +446,31 @@ void Motor_Phase_Test() {
 			Motor_Coil_Off();
 		}
 
-		const char *tname = (target == 0) ? "BOTH" : (target == 1) ? "L" : "R";
-		Custom_LCD_Printf("/0PH %-5s%-4s", tname, coilOn ? "ON" : "OFF");
-		Custom_LCD_Printf("/1L#%d %d%d%d%d", idxL,
-				(outBitL >> 3) & 1, (outBitL >> 2) & 1, (outBitL >> 1) & 1, outBitL & 1);
-		Custom_LCD_Printf("/2R#%d %d%d%d%d", idxR,
-				(outBitR >> 3) & 1, (outBitR >> 2) & 1, (outBitR >> 1) & 1, outBitR & 1);
+		if ((now - lastDraw) >= 60) {
+			lastDraw = now;
+			const char *tname = (target == 0) ? "BOTH" : (target == 1) ? "L" : "R";
+
+			Custom_LCD_Printf("/0" UI_SMALL UI_C_TITLE "%-9s", "MTR PHASE");
+			Custom_LCD_Printf(UI_C_ACCENT "%-6s", tname);
+			if (coilOn)
+				Custom_LCD_Printf(UI_C_OK "ON ");
+			else
+				Custom_LCD_Printf(UI_C_DIM "OFF");
+
+			Custom_LCD_Printf("/1" UI_SMALL UI_C_LABEL "L #");
+			Custom_LCD_Printf(UI_C_VALUE "%d  ", idxL);
+			UI_Bits((uint8_t) (((outBitL & 1) << 3) | ((outBitL & 2) << 1)
+					| ((outBitL & 4) >> 1) | ((outBitL & 8) >> 3)), 4);
+			Custom_LCD_Printf("      ");
+
+			Custom_LCD_Printf("/2" UI_SMALL UI_C_LABEL "R #");
+			Custom_LCD_Printf(UI_C_VALUE "%d  ", idxR);
+			UI_Bits((uint8_t) (((outBitR & 1) << 3) | ((outBitR & 2) << 1)
+					| ((outBitR & 4) >> 1) | ((outBitR & 8) >> 3)), 4);
+			Custom_LCD_Printf("      ");
+
+			Custom_LCD_Printf("/3" UI_SMALL UI_C_LABEL "%-26s", "L R:step  K:target");
+		}
 
 		if (btn_input == INPUT_CMD_K_HOLD) {
 			Motor_Coil_Off();
@@ -429,6 +481,7 @@ void Motor_Phase_Test() {
 		}
 	}
 }
+
 int32_t Distance_Get_L_Mm() {
 	return (int32_t)(stepCountL * MM_PER_STEP);
 }
