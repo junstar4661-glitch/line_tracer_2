@@ -13,8 +13,16 @@
 #include "button.h"
 #include "ui.h"
 
+#include <math.h>      /* fabsf  — PID 적분 와인드업 판정 */
+#include <stdint.h>    /* INT32_MIN */
+
 #define STEER_MAX           0.9f
-#define LINE_LOST_STOP_MS   300
+/* ★ 시간(ms) 기준 → ★거리(mm)★ 기준으로 바꿨다.
+ *   시간으로 잡으면 속도마다 이동거리가 달라져서 1.0~1.5 범위를 못 맞춘다.
+ *      (예전 50ms:  1.0m/s → 5cm 인데 1.5m/s → 7.5cm)
+ *   거리로 잡으면 ★어떤 속도든 항상 8cm★ 에서 멈춘다.
+ *   튜닝 중 잦은 중단이 거슬리면 120으로, 대회 직전엔 50으로 조여라 */
+#define LINE_LOST_STOP_MM    80
 #define DRIVE_ROW_MS         40     // 화면은 한 번에 한 줄만
 
 /* ── 속도 천장 (현재 코드 기준, 2026-08 실측 반영본) ──────────────
@@ -26,19 +34,76 @@
  *   DRIVE_SPD_MAX 를 그 아래로 잡아둔다. 넘기면 명령 차동비 != 실제 차동비가
  *   되어 조향력이 소리없이 샌다 */
 #define DRIVE_SPD_MIN         50
-#define DRIVE_SPD_MAX       1400
-#define DRIVE_SPD_STEP        10
-#define DRIVE_SPD_STEP_FAST   50
+/* ★1425를 넘으면 코너에서 바깥바퀴가 천장(2708)에 걸려
+ *   조향 효율이 절반이 된다. 못 가는 건 아니고 손해보면서 가는 것.
+ *   목표가 1500 이상이라 상한을 물리 한계 근처까지 열어둔다 */
+#define DRIVE_SPD_MAX       2500
+#define DRIVE_SPD_STEP       100     /* L·R 짧게 */
+#define DRIVE_SPD_STEP_FAST  500     /* L·R 길게 */
 
 /* ★ 주행 전 SETUP 화면에서 바꾼다. 빌드 없이 사다리를 올릴 수 있다 */
-volatile int32_t g_drive1Speed = 700;    // Drive_First 기본 속도
-volatile int32_t g_drive2Speed = 700;    // Drive_Second 최고 속도 (코너는 이것의 절반)
+volatile int32_t g_drive1Speed = 1500;   // Drive_First 기본 속도
+volatile int32_t g_drive2Speed = 1500;   // Drive_Second 최고 속도 (코너는 이것의 절반)
 
-volatile int32_t g_steerK_x1e6 = 180;
-#define STEER_K_STEP        5
-#define STEER_K_STEP_FAST  25
-#define STEER_K_MIN         0
-#define STEER_K_MAX      2000
+/* ★ 센서 영점 보정 (p offset).
+ *   센서바가 살짝 어긋났거나 좌우 캘리 밝기가 달라서, 라인 정중앙에 놔도
+ *   p가 0이 안 나오는 경우가 있다. 그 값을 여기 넣으면 빼준다.
+ *
+ *   넣는 법: 메뉴 4 sen state 에서 라인 정중앙에 놓고 뜨는 p 값을 그대로.
+ *            (sen state 화면은 계속 ★보정 전 날값★을 보여준다)
+ *   단위는 p와 같은 0.01mm.  +150 = 오른쪽으로 1.5mm 치우쳐 읽히는 걸 상쇄 */
+volatile int32_t g_pOffset = 0;
+#define P_OFFSET_MIN   (-1500)
+#define P_OFFSET_MAX   ( 1500)
+#define P_OFFSET_STEP     10
+#define P_OFFSET_FAST     50
+
+/* ── PID 조향 ─────────────────────────────────────────────────
+ *   오차 e = p (라인 중심에서 벗어난 거리 x100, 단위 0.01mm)
+ *
+ *      s = ( Kp·e  +  Ki·∫e dt  +  Kd·de/dt ) x 1e-6
+ *
+ *   · Kp 만 쓰면 예전과 완전히 같다 (Ki=Kd=0 이 기본값)
+ *   · 라인트레이서에서 ★I는 보통 해롭다.★ 긴 코너에서 적분이 쌓여
+ *     코너 탈출 때 반대로 튄다. 0으로 두는 게 정석이다
+ *   · D는 진동을 눌러줘서 Kp를 더 올릴 수 있게 해준다.
+ *     "Kp 올리면 사행 / 내리면 이탈"이 될 때만 켜라
+ *
+ *   ★제어 주기를 2ms로 고정한다.★ D는 미분이라 주기가 흔들리면 값이 튄다.
+ *     예전엔 루프가 도는 대로(수 kHz, LCD 그릴 땐 멈춤) 불규칙했다 */
+#define PID_PERIOD_MS      2
+#define PID_D_LPF          0.2f      /* D 저역통과. p가 계단식이라 날것은 스파이크 */
+#define PID_I_CLAMP    30000.0f      /* 적분 폭주 백스톱 */
+
+volatile int32_t g_kp = 180;
+volatile int32_t g_ki = 0;
+volatile int32_t g_kd = 0;
+
+#define GAIN_P_MAX      2000
+#define GAIN_I_MAX       500
+#define GAIN_D_MAX      2000
+#define GAIN_STEP         10     /* L·R 짧게 */
+#define GAIN_STEP_FAST    50     /* L·R 길게 */
+
+static float   pidI = 0.0f;
+static float   pidD = 0.0f;
+static int32_t pidPrevE = 0;
+static float   pidLastS = 0.0f;
+static uint8_t pidFirst = 1;
+
+/* ★진단용★ 주행 중 오차를 화면에 그대로 띄운다.
+ *   pNow   = 지금 오차 (보정 후)
+ *   pStart = 출발 직후 첫 오차. ★출발 튐의 원인을 여기서 본다★ */
+volatile int32_t g_pNow = 0;
+volatile int32_t g_pStart = 0;
+
+static void Drive_PID_Reset(void) {
+	pidI = 0.0f;
+	pidD = 0.0f;
+	pidPrevE = 0;
+	pidLastS = 0.0f;
+	pidFirst = 1;      /* 첫 호출에서 D가 튀지 않게 */
+}
 
 #define MARK_LOG_MAX    50
 typedef struct {
@@ -69,10 +134,18 @@ static void Drive_Stop_Graceful(void) {
  *   L / R      : 값 -, +      (길게 누르면 큰 폭으로)
  *   K 짧게     : 편집 대상 전환 (K <-> SPD)
  *   K 길게     : 확정하고 출발 */
+static int32_t clampi(int32_t v, int32_t lo, int32_t hi) {
+	if (v < lo) return lo;
+	if (v > hi) return hi;
+	return v;
+}
+
 static void Drive_Setup(const char *title, volatile int32_t *spd) {
-	uint8_t sel = 0;
-	int32_t drawnK = -1, drawnS = -1, drawnA = -1;
-	uint8_t drawnSel = 0xFF;
+	uint8_t sel = 0, drawnSel = 0xFF;
+	int32_t vals[UI_SET_COUNT], drawn[UI_SET_COUNT];
+
+	for (uint8_t i = 0; i < UI_SET_COUNT; i++)
+		drawn[i] = INT32_MIN;
 
 	Button_Flush();
 	UI_Setup_Frame(title);
@@ -80,7 +153,7 @@ static void Drive_Setup(const char *title, volatile int32_t *spd) {
 	while (1) {
 		UserInput_t b = Button_Get_Input();
 		int32_t dir = 0;
-		uint8_t fast = 0;
+		uint8_t fast = 0, changed = 0;
 
 		switch (b) {
 		case INPUT_CMD_L_SINGLE: dir = -1;            break;
@@ -88,51 +161,106 @@ static void Drive_Setup(const char *title, volatile int32_t *spd) {
 		case INPUT_CMD_L_HOLD:   dir = -1; fast = 1;  break;
 		case INPUT_CMD_R_HOLD:   dir = +1; fast = 1;  break;
 		case INPUT_CMD_K_SINGLE:
-			sel = (uint8_t) ((sel + 1u) % UI_SETUP_ROWS);
+			sel = (uint8_t) ((sel + 1u) % UI_SET_COUNT);
 			break;
 		case INPUT_CMD_K_HOLD:   return;
 		default: break;
 		}
 
 		if (dir) {
-			if (sel == 0) {
-				g_steerK_x1e6 += dir * (fast ? STEER_K_STEP_FAST : STEER_K_STEP);
-				if (g_steerK_x1e6 < STEER_K_MIN) g_steerK_x1e6 = STEER_K_MIN;
-				if (g_steerK_x1e6 > STEER_K_MAX) g_steerK_x1e6 = STEER_K_MAX;
-			} else if (sel == 1) {
-				*spd += dir * (fast ? DRIVE_SPD_STEP_FAST : DRIVE_SPD_STEP);
-				if (*spd < DRIVE_SPD_MIN) *spd = DRIVE_SPD_MIN;
-				if (*spd > DRIVE_SPD_MAX) *spd = DRIVE_SPD_MAX;
-			} else {
+			int32_t gs = dir * (fast ? GAIN_STEP_FAST : GAIN_STEP);
+
+			switch ((UI_SetupItem_t) sel) {
+			case UI_SET_KP:
+				g_kp = clampi(g_kp + gs, 0, GAIN_P_MAX);
+				break;
+			case UI_SET_KI:
+				g_ki = clampi(g_ki + gs, 0, GAIN_I_MAX);
+				break;
+			case UI_SET_KD:
+				g_kd = clampi(g_kd + gs, 0, GAIN_D_MAX);
+				break;
+			case UI_SET_SPD:
+				*spd = clampi(*spd + dir * (fast ? DRIVE_SPD_STEP_FAST
+						: DRIVE_SPD_STEP), DRIVE_SPD_MIN, DRIVE_SPD_MAX);
+				break;
+			case UI_SET_ACC:
 				Ramp_Set_Accel(Ramp_Get_Accel()
 						+ dir * (fast ? RAMP_ACCEL_FAST : RAMP_ACCEL_STEP));
+				break;
+			case UI_SET_DEC:
+				Ramp_Set_Decel(Ramp_Get_Decel()
+						+ dir * (fast ? RAMP_ACCEL_FAST : RAMP_ACCEL_STEP));
+				break;
+			default:
+				g_pOffset = clampi(g_pOffset + dir * (fast ? P_OFFSET_FAST
+						: P_OFFSET_STEP), P_OFFSET_MIN, P_OFFSET_MAX);
+				break;
 			}
 		}
 
+		vals[UI_SET_KP]  = g_kp;
+		vals[UI_SET_KI]  = g_ki;
+		vals[UI_SET_KD]  = g_kd;
+		vals[UI_SET_SPD] = *spd;
+		vals[UI_SET_ACC] = Ramp_Get_Accel();
+		vals[UI_SET_DEC] = Ramp_Get_Decel();
+		vals[UI_SET_OFS] = g_pOffset;
+
+		for (uint8_t i = 0; i < UI_SET_COUNT; i++)
+			if (vals[i] != drawn[i]) { changed = 1; drawn[i] = vals[i]; }
+
 		/* 값이 안 바뀌었는데 매 루프 다시 그리면 SPI가 버튼 응답을 잡아먹는다 */
-		if (g_steerK_x1e6 != drawnK || *spd != drawnS
-				|| Ramp_Get_Accel() != drawnA || sel != drawnSel) {
-			drawnK = g_steerK_x1e6;
-			drawnS = *spd;
-			drawnA = Ramp_Get_Accel();
+		if (changed || sel != drawnSel) {
 			drawnSel = sel;
-			UI_Setup_Update(g_steerK_x1e6, *spd, drawnA, sel);
+			UI_Setup_Update(vals, sel);
 		}
 	}
 }
 
+/* ★★★ 임시 해제 스위치 ★★★
+ *   7번 센서 고장으로 캘리가 항상 CAL FAIL 이라 주행 진입이 막힌다.
+ *   센서 고치면 아래 줄의 // 를 지워서 다시 켜라.
+ *
+ *   #define DRIVE_REQUIRE_CAL       ← 이 줄을 살리면 원래대로 (캘리 필수)
+ *
+ *   해제 상태에서 알아둘 것
+ *     · 위치계산은 1~6번만 쓰므로 ★주행은 정상 동작한다★
+ *     · 마커는 bit0(왼쪽)만 잡힌다. RIGHT / END / CROSS 는 안 뜬다
+ *     · END 가 안 뜨니 Drive_First 가 ★자동 종료를 못 한다★ → K 길게로 직접 정지
+ *     · 그래서 1차주행 지도(markLog)는 신뢰할 수 없다. 2차주행은 하지 마라
+ */
+// #define DRIVE_REQUIRE_CAL
+
 static uint8_t Drive_Precheck(const char *title, volatile int32_t *spd) {
+#ifdef DRIVE_REQUIRE_CAL
 	if (!Sensor_Is_Calibrated()) {
 		UI_Banner("NO CAL", "run 2 calibrate first", UI_C_BAD, 1800);
 		Button_Flush();
 		return 0;
 	}
+#else
+	/* 캘리 실패 상태로 달리고 있다는 걸 화면으로 계속 알린다 */
+	if (!Sensor_Is_Calibrated())
+		UI_Banner("NO CAL", "running anyway", UI_C_WARN, 1200);
+#endif
 
 	Drive_Setup(title, spd);
 
+	/* ★ 카운트다운 중에 아무 버튼이나 짧게 누르면 취소된다.
+	 *   값만 바꾸고 주행은 안 하고 싶을 때 쓰는 탈출구.
+	 *   K 길게는 무시한다 — GO 누른 손가락이 아직 붙어 있을 수 있다 */
 	for (int8_t s = 3; s > 0; s--) {
+		uint32_t t0 = HAL_GetTick();
 		UI_Countdown(title, s);
-		HAL_Delay(1000);
+		while (HAL_GetTick() - t0 < 1000) {
+			UserInput_t b = Button_Get_Input();
+			if (b != INPUT_CMD_NONE && b != INPUT_CMD_K_HOLD) {
+				UI_Banner("CANCELLED", "values kept", UI_C_WARN, 900);
+				Button_Flush();
+				return 0;
+			}
+		}
 	}
 
 	Button_Flush();
@@ -140,16 +268,41 @@ static uint8_t Drive_Precheck(const char *title, volatile int32_t *spd) {
 	return 1;
 }
 
+/* ★ PID_PERIOD_MS 주기로만 불러라. dt가 고정이어야 D가 의미가 있다 */
 static void Drive_Steer(float v_base) {
-	int32_t p = Sensor_Get_Position();
-	float steerK = (float) g_steerK_x1e6 / 1000000.0f;
-	float s = (float) p * steerK;
+	const float dt = (float) PID_PERIOD_MS / 1000.0f;
+	int32_t e = Sensor_Get_Position() - g_pOffset;   /* 영점 보정된 오차 */
+	float dRaw, s;
+
+	/* ── I: 조향이 이미 한계면 더 안 쌓는다 (적분 와인드업 방지) ── */
+	if (fabsf(pidLastS) < STEER_MAX)
+		pidI += (float) e * dt;
+	if (pidI >  PID_I_CLAMP) pidI =  PID_I_CLAMP;
+	if (pidI < -PID_I_CLAMP) pidI = -PID_I_CLAMP;
+
+	/* ── D: 1차 저역통과를 건다 ──
+	 *   ★첫 호출에는 이전값이 없다.★ 0으로 두면 de/dt = e/0.002 로
+	 *   500배 뻥튀기된 스파이크가 나가서 출발하자마자 확 꺾인다 */
+	if (pidFirst) {
+		pidPrevE = e;
+		g_pStart = e;          /* 출발 순간의 오차를 박제해둔다 */
+		pidFirst = 0;
+	}
+	g_pNow = e;
+	dRaw = (float) (e - pidPrevE) / dt;
+	pidD += (dRaw - pidD) * PID_D_LPF;
+	pidPrevE = e;
+
+	s = ((float) g_kp * (float) e
+	   + (float) g_ki * pidI
+	   + (float) g_kd * pidD) * 0.000001f;
 
 	if (s > STEER_MAX)
 		s = STEER_MAX;
 	else if (s < -STEER_MAX)
 		s = -STEER_MAX;
 
+	pidLastS = s;
 	Ramp_Set_Target(v_base * (1.0f + s), v_base * (1.0f - s));
 }
 
@@ -188,11 +341,12 @@ static void Drive_Log_Review(void) {
  *   R 길게 = 로그 보기
  * K 길게(=주행 정지 버튼)는 무시한다. 정지 직후라 아직 눌려 있을 수 있고,
  * 그러면 창이 열리자마자 닫힌다 */
-static void Drive_Result_Window(uint8_t ok, uint8_t marks, int32_t dist,
-		uint8_t allowLog) {
+static void Drive_Result_Window(UI_EndReason_t reason, uint8_t marks,
+		int32_t dist, uint8_t allowLog) {
+	const char *hint = allowLog ? "R-hold:log    K:exit" : "K: exit";
+
 	Button_Flush();
-	UI_Drive_Result(ok, marks, dist,
-			allowLog ? "R-hold:log    K:exit" : "K: exit");
+	UI_Drive_Result(reason, marks, dist, hint);
 
 	while (1) {
 		UserInput_t b = Button_Get_Input();
@@ -201,7 +355,7 @@ static void Drive_Result_Window(uint8_t ok, uint8_t marks, int32_t dist,
 			Drive_Log_Review();
 			/* 로그를 보고 나오면 결과창을 다시 그려서 계속 머문다 */
 			Button_Flush();
-			UI_Drive_Result(ok, marks, dist, "R-hold:log    K:exit");
+			UI_Drive_Result(reason, marks, dist, hint);
 			continue;
 		}
 		if (b == INPUT_CMD_K_SINGLE)
@@ -214,10 +368,12 @@ void Drive_First() {
 	markLogCount = 0;
 	int32_t lastMarkDist = 0;
 	uint8_t endCount = 0;
-	uint32_t lostSince = 0;
+	int32_t lostAtDist = 0;
+	uint8_t lostFlag = 0;
 	uint32_t lastRow = 0;
+	uint32_t lastPid = 0;
 	uint8_t row = 0;
-	uint8_t stoppedByLineLoss = 0;
+	UI_EndReason_t reason = UI_END_COMPLETE;
 	const char *lastMarkName = "-";
 	MarkType_t mt;
 
@@ -225,6 +381,8 @@ void Drive_First() {
 		return;
 
 	Mark_FSM_Reset();
+	Sensor_Reset_Line();
+	Drive_PID_Reset();
 	Distance_Reset();
 	Ramp_Reset();
 	Sensor_Start();
@@ -236,15 +394,20 @@ void Drive_First() {
 		uint32_t now = HAL_GetTick();
 
 		/* ── 순수 주행 로직. 블로킹 없음, GPIO 읽기 없음 ────── */
-		Drive_Steer((float) g_drive1Speed);
+		/* ★PID는 2ms 고정 주기로만 돈다. D가 미분이라 주기가 흔들리면 안 된다 */
+		if ((now - lastPid) >= PID_PERIOD_MS) {
+			lastPid = now;
+			Drive_Steer((float) g_drive1Speed);
+		}
 
 		if (Sensor_Line_Found()) {
-			lostSince = 0;
+			lostFlag = 0;              /* 라인 보임 → 리셋 */
 		} else {
-			if (lostSince == 0)
-				lostSince = now;
-			else if ((now - lostSince) > LINE_LOST_STOP_MS) {
-				stoppedByLineLoss = 1;
+			if (!lostFlag) {
+				lostFlag = 1;
+				lostAtDist = Distance_Get_Mm();   /* 놓친 지점 기록 */
+			} else if ((Distance_Get_Mm() - lostAtDist) > LINE_LOST_STOP_MM) {
+				reason = UI_END_LINE_LOST;
 				break;
 			}
 		}
@@ -255,6 +418,10 @@ void Drive_First() {
 				markLog[markLogCount].type = mt;
 				markLog[markLogCount].distFromPrev = nowDist - lastMarkDist;
 				markLogCount++;
+			} else {
+				/* 기록칸이 꽉 찼다. 더 달려봐야 지도가 안 남는다 */
+				reason = UI_END_LOG_FULL;
+				break;
 			}
 			lastMarkDist = nowDist;
 			lastMarkName = MARK_NAME[mt];
@@ -264,11 +431,11 @@ void Drive_First() {
 		}
 
 		if (endCount >= 2)
-			break;
+			break;                      /* reason 은 COMPLETE 그대로 */
 
 		/* 버튼은 SysTick이 이미 읽었다. 여기선 플래그만 본다 */
 		if (Button_Stop_Requested()) {
-			stoppedByLineLoss = 1;   /* 사용자 취소도 즉시정지 */
+			reason = UI_END_USER;
 			break;
 		}
 		/* ── 주행 로직 끝 ─────────────────────────────────── */
@@ -281,13 +448,14 @@ void Drive_First() {
 		}
 	}
 
-	if (stoppedByLineLoss)
-		Drive_Stop_Immediate();
-	else
+	/* 정상 완주만 부드럽게 감속. 실패는 즉시 전류 차단 */
+	if (reason == UI_END_COMPLETE)
 		Drive_Stop_Graceful();
+	else
+		Drive_Stop_Immediate();
 	Sensor_Stop();
 
-	Drive_Result_Window((uint8_t) !stoppedByLineLoss, markLogCount,
+	Drive_Result_Window(reason, markLogCount,
 			Distance_Get_Mm(), (uint8_t) (markLogCount > 0));
 }
 
@@ -307,16 +475,20 @@ void Drive_Second() {
 	uint8_t logIdx = 0;
 	int32_t distSinceMark = 0;
 	int32_t lastDist = 0;
-	uint32_t lostSince = 0;
+	int32_t lostAtDist = 0;
+	uint8_t lostFlag = 0;
 	uint32_t lastRow = 0;
+	uint32_t lastPid = 0;
 	uint8_t row = 0;
-	uint8_t stoppedByLineLoss = 0;
+	UI_EndReason_t reason = UI_END_MAP_DONE;
 	MarkType_t mt;
 
 	if (!Drive_Precheck("DRIVE 2nd", &g_drive2Speed))
 		return;
 
 	Mark_FSM_Reset();
+	Sensor_Reset_Line();
+	Drive_PID_Reset();
 	Distance_Reset();
 	Ramp_Reset();
 	Sensor_Start();
@@ -347,15 +519,19 @@ void Drive_Second() {
 			v_target = v_turn;
 		}
 
-		Drive_Steer(v_target);
+		if ((now - lastPid) >= PID_PERIOD_MS) {
+			lastPid = now;
+			Drive_Steer(v_target);
+		}
 
 		if (Sensor_Line_Found()) {
-			lostSince = 0;
+			lostFlag = 0;              /* 라인 보임 → 리셋 */
 		} else {
-			if (lostSince == 0)
-				lostSince = now;
-			else if ((now - lostSince) > LINE_LOST_STOP_MS) {
-				stoppedByLineLoss = 1;
+			if (!lostFlag) {
+				lostFlag = 1;
+				lostAtDist = Distance_Get_Mm();   /* 놓친 지점 기록 */
+			} else if ((Distance_Get_Mm() - lostAtDist) > LINE_LOST_STOP_MM) {
+				reason = UI_END_LINE_LOST;
 				break;
 			}
 		}
@@ -364,11 +540,11 @@ void Drive_Second() {
 			distSinceMark = 0;
 			logIdx++;
 			if (logIdx >= markLogCount)
-				break;
+				break;              /* reason 은 MAP_DONE 그대로 */
 		}
 
 		if (Button_Stop_Requested()) {
-			stoppedByLineLoss = 1;
+			reason = UI_END_USER;
 			break;
 		}
 		/* ── 주행 로직 끝 ─────────────────────────────────── */
@@ -382,12 +558,11 @@ void Drive_Second() {
 		}
 	}
 
-	if (stoppedByLineLoss)
-		Drive_Stop_Immediate();
-	else
+	if (reason == UI_END_MAP_DONE)
 		Drive_Stop_Graceful();
+	else
+		Drive_Stop_Immediate();
 	Sensor_Stop();
 
-	Drive_Result_Window((uint8_t) !stoppedByLineLoss, markLogCount,
-			Distance_Get_Mm(), 0);
+	Drive_Result_Window(reason, markLogCount, Distance_Get_Mm(), 0);
 }

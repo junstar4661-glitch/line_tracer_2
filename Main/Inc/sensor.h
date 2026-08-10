@@ -31,6 +31,7 @@ void Sensor_Test_Phase(void);
 
 int32_t Sensor_Get_Position(void);
 uint8_t Sensor_Line_Found(void);
+void Sensor_Reset_Line(void);
 uint8_t Sensor_Is_Calibrated(void);
 
 /* 캘리브레이션에서 흑백 대비를 확보한 센서 = 1. bit0~bit7 */

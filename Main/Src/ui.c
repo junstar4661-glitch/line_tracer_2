@@ -16,6 +16,7 @@
 #include "custom_lcd.h"
 #include "st7735_lcd.h"
 #include "st7735.h"
+#include "drive.h"      /* g_pNow / g_pStart — 진단 숫자를 화면에 띄운다 */
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -142,6 +143,20 @@ void UI_Badge(const char *badge, uint16_t badgeCol) {
 	/* 배지 영역만 헤더색으로 지우고 다시 쓴다 (제목은 건드리지 않는다) */
 	UI_Fill(UI_BADGE_X, 0, (int16_t) (UI_W - UI_BADGE_X), UI_FH, UI_C_HEAD);
 	ui_puts(x, 0, badgeCol, UI_C_HEAD, 12, badge);
+}
+
+/* ★ 속도는 화면에 전부 m/s 로 띄운다. 내부 계산은 mm/s 그대로.
+ *   1500 mm/s → " 1.50"  (5칸 고정폭이라 자리가 안 흔들린다) */
+void UI_MS(char *dst, size_t n, int32_t mm_s) {
+	int32_t a = (mm_s < 0) ? -mm_s : mm_s;
+	snprintf(dst, n, "%s%ld.%02ld", (mm_s < 0) ? "-" : " ",
+			(long) (a / 1000), (long) ((a % 1000) / 10));
+}
+
+void UI_Badge_Int(const char *name, int32_t v, uint16_t col) {
+	char b[16];
+	snprintf(b, sizeof(b), "%s %ld", name, (long) v);
+	UI_Badge(b, col);
 }
 
 void UI_Hint(const char *hint) {
@@ -399,16 +414,19 @@ void UI_MotorSpd_Frame(void) {
 }
 
 void UI_MotorSpd_Update(int16_t spdL, int16_t spdR, int8_t dirL, int8_t dirR,
-		float vL, float vR, uint8_t running, uint8_t target) {
-	const char *tn = (target == 0) ? "BOTH" : (target == 1) ? "L" : "R";
-	char buf[24];
+		float vL, float vR, uint8_t running, uint8_t target, int32_t trim) {
+	const char *tn = (target == 0) ? "BOTH" : (target == 1) ? "L"
+				   : (target == 2) ? "R"    : "TRIM";
+	char buf[28], mL[8], mR[8];
 	float aL = (vL < 0) ? -vL : vL;
 	float aR = (vR < 0) ? -vR : vR;
 
 	snprintf(buf, sizeof(buf), "%s %s", running ? "RUN" : "OFF", tn);
 	UI_Badge(buf, running ? UI_C_OK : UI_C_DIM);
 
-	snprintf(buf, sizeof(buf), "L%-4d R%-4d", spdL, spdR);
+	UI_MS(mL, sizeof(mL), spdL);
+	UI_MS(mR, sizeof(mR), spdR);
+	snprintf(buf, sizeof(buf), "L%s R%s m/s", mL, mR);
 	ui_row(27, 16, UI_C_VALUE, UI_C_BG, 22, buf);
 
 	UI_Text(27, 29, (dirL > 0) ? UI_C_OK : UI_C_WARN, UI_C_BG,
@@ -416,11 +434,18 @@ void UI_MotorSpd_Update(int16_t spdL, int16_t spdR, int8_t dirL, int8_t dirR,
 	UI_Text(75, 29, (dirR > 0) ? UI_C_OK : UI_C_WARN, UI_C_BG,
 			"R%-4s", (dirR > 0) ? "FWD" : "REV");
 
-	snprintf(buf, sizeof(buf), "L%-4d R%-4d", (int) vL, (int) vR);
+	/* 좌우 보정값. TRIM 모드일 때 노랗게 강조된다 */
+	UI_Text(112, 29, (target == 3) ? UI_C_ACCENT : UI_C_DIM, UI_C_BG,
+			"T%+4ld", (long) trim);
+
+	UI_MS(mL, sizeof(mL), (int32_t) vL);
+	UI_MS(mR, sizeof(mR), (int32_t) vR);
+	snprintf(buf, sizeof(buf), "L%s R%s m/s", mL, mR);
 	ui_row(27, 42, UI_C_VALUE, UI_C_BG, 22, buf);
 
-	/* 좌우 각각 0~500mm/s 게이지. 물리 상한(ARR_MIN이 정하는 값)에 빨간 눈금.
-	 * 바퀴 실측(52.0648mm) 반영 후 상한은 408.5 mm/s다 */
+	/* 게이지 스케일은 mm/s 그대로 쓴다 (0 ~ UI_SPD_SCALE).
+	 * 빨강 = 물리 상한 2708, 주황 = 조향 무포화 상한 1425.
+	 * 숫자만 m/s로 표시하고 내부 계산 단위는 안 바꿨다 */
 	UI_Gauge(14, 55, 142, 10, (int32_t) aL, UI_SPD_SCALE, running ? UI_C_OK : UI_C_DIM);
 	UI_Gauge(14, 66, 142, 10, (int32_t) aR, UI_SPD_SCALE, running ? UI_C_OK : UI_C_DIM);
 	UI_Fill(UI_SPD_TICK_X, 55, 1, 10, UI_C_BAD);
@@ -471,40 +496,64 @@ void UI_MotorPhase_Update(uint8_t idxL, uint8_t idxR, uint8_t bitsL, uint8_t bit
  *  TUNE STEER_K / 카운트다운
  * ──────────────────────────────────────────────── */
 
-#define SETUP_R0_Y   16
-#define SETUP_R1_Y   33
-#define SETUP_R2_Y   50
-#define SETUP_ROW_H  16
+/* 5줄: 14 + 13x5 = 79. 값 글씨는 6x12 (16px 큰글씨는 5줄에 안 들어간다).
+ * 대신 선택된 줄을 배경색 + 노란 막대로 확실히 구분한다 */
+#define SETUP_Y0     14
+#define SETUP_ROW_H  13
 
 /* ★ K는 정수 그대로 띄운다. 예전 "0.000180" 표기는 자릿수도 깨졌고
  *   현장에서 눈으로 비교하기도 나빴다. 내부적으로만 x1e-6 이다 */
-static void ui_setup_row(int16_t y, uint8_t on, const char *name,
-		int32_t v, const char *unit) {
+static void ui_setup_row(uint8_t idx, uint8_t on, const char *name,
+		const char *val, const char *unit) {
+	int16_t y = (int16_t) (SETUP_Y0 + idx * SETUP_ROW_H);
 	uint16_t bg = on ? UI_C_HEAD : UI_C_BG;
 	uint16_t nc = on ? UI_C_ACCENT : UI_C_DIM;
 	uint16_t vc = on ? UI_C_VALUE : UI_C_LABEL;
-	char b[8];
 
 	UI_Fill(0, y, UI_W, SETUP_ROW_H, bg);
 	if (on)
 		UI_Fill(0, y, 3, SETUP_ROW_H, UI_C_ACCENT);
 
-	ui_puts(7, (int16_t) (y + 2), nc, bg, 12, name);
-	snprintf(b, sizeof(b), "%5ld", (long) v);
-	ui_puts(40, y, vc, bg, 16, b);
-	ui_puts(84, (int16_t) (y + 2), nc, bg, 12, unit);
+	ui_puts(7,  (int16_t) (y + 1), nc, bg, 12, name);
+	ui_puts(42, (int16_t) (y + 1), vc, bg, 12, val);
+	ui_puts(90, (int16_t) (y + 1), nc, bg, 12, unit);
 }
 
 void UI_Setup_Frame(const char *title) {
 	UI_Clear();
 	UI_Header(title, "SETUP", UI_C_ACCENT);
-	UI_Hint("L- R+  K:sel  Khold:GO");
 }
 
-void UI_Setup_Update(int32_t k, int32_t spd, int32_t acc, uint8_t sel) {
-	ui_setup_row(SETUP_R0_Y, (uint8_t) (sel == 0), "K  ", k,   "gain");
-	ui_setup_row(SETUP_R1_Y, (uint8_t) (sel == 1), "SPD", spd, "mm/s");
-	ui_setup_row(SETUP_R2_Y, (uint8_t) (sel == 2), "ACC", acc, "mm/ss");
+static const char *const SETUP_NAME[UI_SET_COUNT] = {
+	"P  ", "I  ", "D  ", "SPD", "ACC", "DEC", "OFS"
+};
+static const char *const SETUP_UNIT[UI_SET_COUNT] = {
+	"gain", "gain", "gain", "m/s", "m/ss", "m/ss", "p zero"
+};
+
+void UI_Setup_Update(const int32_t *vals, uint8_t sel) {
+	uint8_t top;
+	char b[10], badge[8];
+
+	/* 선택이 보이는 창 아래로 내려가면 창을 끌어내린다 */
+	top = (sel < UI_SETUP_VISIBLE) ? 0
+			: (uint8_t) (sel - (UI_SETUP_VISIBLE - 1));
+
+	snprintf(badge, sizeof(badge), "%d/%d", sel + 1, UI_SET_COUNT);
+	UI_Badge(badge, UI_C_ACCENT);
+
+	for (uint8_t r = 0; r < UI_SETUP_VISIBLE; r++) {
+		uint8_t i = (uint8_t) (top + r);
+
+		if (i == UI_SET_SPD)
+			UI_MS(b, sizeof(b), vals[i]);
+		else if (i == UI_SET_OFS)
+			snprintf(b, sizeof(b), "%+5ld", (long) vals[i]);
+		else
+			snprintf(b, sizeof(b), "%5ld", (long) vals[i]);
+
+		ui_setup_row(r, (uint8_t) (i == sel), SETUP_NAME[i], b, SETUP_UNIT[i]);
+	}
 }
 
 void UI_Countdown(const char *title, int8_t sec) {
@@ -540,16 +589,19 @@ void UI_Drive_Row(uint8_t row, int32_t dist, uint8_t mkIdx, uint8_t mkTotal,
 		break;
 
 	case 1:
-		if (mkTotal)
-			snprintf(buf, sizeof(buf), "mk %d/%d %s", mkIdx, mkTotal,
-					mkName ? mkName : "-");
-		else
-			snprintf(buf, sizeof(buf), "mk %d %s", mkIdx, mkName ? mkName : "-");
+		/* ★진단★ 마커 정보 + 지금 오차 p. 출발 튐을 눈으로 보려고 넣었다 */
+		snprintf(buf, sizeof(buf), "mk%-2d %-6s p%+5ld",
+				mkIdx, mkName ? mkName : "-", (long) g_pNow);
 		ui_row(4, DRV_MARK_Y, UI_C_ACCENT, UI_C_BG, 25, buf);
 		break;
 
 	case 2:
-		snprintf(buf, sizeof(buf), "spd L%-4d R%-4d", (int) vL, (int) vR);
+		{
+			char mL[8], mR[8];
+			UI_MS(mL, sizeof(mL), (int32_t) vL);
+			UI_MS(mR, sizeof(mR), (int32_t) vR);
+			snprintf(buf, sizeof(buf), "spd L%s R%s m/s", mL, mR);
+		}
 		ui_row(4, DRV_SPD_Y, UI_C_VALUE, UI_C_BG, 25, buf);
 		break;
 
@@ -561,20 +613,57 @@ void UI_Drive_Row(uint8_t row, int32_t dist, uint8_t mkIdx, uint8_t mkTotal,
 	}
 }
 
-void UI_Drive_Result(uint8_t ok, uint8_t marks, int32_t dist, const char *hint) {
+/* ── 결과 화면 ────────────────────────────────────────
+ *  y 15..34   ★중지 이유★  색 배경 + 8x16 큰 글씨 (제일 눈에 띄게)
+ *  y 37..48   왜 그랬는지 한 줄 설명
+ *  y 51..66   마커 수 / 거리 — 8x16 큰 글씨
+ *  y 68..79   조작 안내
+ * ──────────────────────────────────────────────────── */
+#define RES_BAND_Y   15
+#define RES_BAND_H   20
+#define RES_WHY_Y    37
+#define RES_NUM_Y    51
+
+void UI_Drive_Result(UI_EndReason_t reason, uint8_t marks, int32_t dist,
+		const char *hint) {
+	const char *big;      /* 밴드에 들어갈 큰 글씨 */
+	const char *why;      /* 아래 한 줄 설명       */
+	uint16_t col;         /* 밴드 배경색           */
+	uint8_t ok;
+	int16_t bx;
+	char buf[24];
+
+	switch (reason) {
+	case UI_END_COMPLETE:
+		big = "COMPLETE";  why = "END mark seen twice";  col = UI_C_OK;   ok = 1; break;
+	case UI_END_MAP_DONE:
+		big = "MAP DONE";  why = "all marks replayed";   col = UI_C_OK;   ok = 1; break;
+	case UI_END_LINE_LOST:
+		big = "LINE LOST"; why = "no line for 50ms";     col = UI_C_BAD;  ok = 0; break;
+	case UI_END_USER:
+		big = "USER STOP"; why = "K-hold pressed";       col = UI_C_WARN; ok = 0; break;
+	default:
+		big = "LOG FULL";  why = "mark buffer overflow"; col = UI_C_WARN; ok = 0; break;
+	}
+
 	UI_Clear();
-	if (ok)
-		UI_Header("DRIVE DONE", "OK", UI_C_OK);
-	else
-		UI_Header("STOPPED", "HALT", UI_C_WARN);
+	UI_Header("RESULT", ok ? "OK" : "FAIL", ok ? UI_C_OK : UI_C_BAD);
 
-	UI_Text(3, 20, UI_C_LABEL, UI_C_BG, "marks");
-	UI_Text(45, 20, UI_C_VALUE, UI_C_BG, "%-4d", marks);
-	UI_Text(3, 36, UI_C_LABEL, UI_C_BG, "dist");
-	UI_Text(45, 36, UI_C_VALUE, UI_C_BG, "%-6ld mm", (long) dist);
+	/* 중지 이유 — 색 밴드 위에 큰 글씨, 가운데 정렬 */
+	UI_Fill(0, RES_BAND_Y, UI_W, RES_BAND_H, col);
+	bx = (int16_t) ((UI_W - (int16_t) strlen(big) * UI_FW_BIG) / 2);
+	if (bx < 0) bx = 0;
+	ui_puts(bx, (int16_t) (RES_BAND_Y + 2), UI_C_BLACK, col, 16, big);
 
-	if (!ok)
-		UI_Text(3, 50, UI_C_WARN, UI_C_BG, "line lost / cancelled");
+	ui_row(3, RES_WHY_Y, ok ? UI_C_LABEL : col, UI_C_BG, 26, why);
+
+	/* 숫자도 큰 글씨로. mk = 마커 개수, 그 옆이 총 주행거리 */
+	snprintf(buf, sizeof(buf), "mk%-3d %5ldmm", marks, (long) dist);
+	ui_puts(3, RES_NUM_Y, UI_C_VALUE, UI_C_BG, 16, buf);
+
+	/* ★출발 순간의 오차★ — 출발 튐 진단의 핵심 숫자 */
+	snprintf(buf, sizeof(buf), "p at start %+5ld", (long) g_pStart);
+	ui_row(3, RES_WHY_Y + 12, UI_C_ACCENT, UI_C_BG, 26, buf);
 
 	if (hint)
 		UI_Hint(hint);

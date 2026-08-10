@@ -28,6 +28,10 @@
  *  w=100-norm=100 이 되어 "라인이 여기 있다"는 최대 확신으로 뒤집혔다) */
 #define SENSOR_MIN_SPAN   12
 
+/* 흰색/검정 판정 문턱. sen state 화면에서 L/R로 조정한다 */
+#define SENSOR_THR_MIN    10
+#define SENSOR_THR_MAX    90
+
 /* 마커 글리치 가드. 마커 FSM은 ADC ISR에서 1kHz로 도므로 단위가 곧 ms다 */
 #define MARK_MIN_MS       8     // 이보다 짧은 발화는 노이즈로 버린다
 #define MARK_GAP_MIN_MS   40    // 확정 직후 이 시간 안의 재발화는 채터링으로 무시
@@ -78,6 +82,10 @@ const float sensorLinePosMm[8] = {
    +7.5, +23.5, +37.5,
     0
 };
+
+/* Sensor_Get_Position이 돌려주는 p의 최대 절댓값.
+ * 제일 바깥 라인센서 37.5mm x 100 = 3750 */
+#define SENSOR_POS_MAX   3750
 
 volatile int32_t linePosition = 0;
 volatile uint8_t lineFound = 0;
@@ -136,13 +144,17 @@ static void Mark_FSM_Step(uint8_t st) {
 
 		/* 3. 마커 두개가 다 켜졌으면 */
 		if ((markAccum & 0x81) == 0x81) {
-			/* 누적 상황에서 마커 포함 6개 이상 켜졌으면 cross 아니면 end로 처리한다. */
-			if (__builtin_popcount(markAccum) >= 6) {
+			/* ★ 전체 개수가 아니라 ★가운데 라인센서(bit1~6)★ 개수로 가른다.
+			 *   CROSS = 라인을 가로지르는 선 → 가운데가 전부 흰색이 된다
+			 *   END   = 양옆에만 마커        → 가운데는 라인 위 1~2개뿐
+			 *   전체(0~7)로 세면 END에서도 마커2 + 라인2 + 흔들림2 = 6이 나와서
+			 *   구분이 안 됐다. 0x7E = bit1~bit6 만 남기는 마스크 */
+			if (__builtin_popcount(markAccum & 0x7E) >= 5) {
 				markPendingType = MARKTYPE_CROSS;
 			} else {
 				markPendingType = MARKTYPE_END;
 			}
-		} 
+		}
 		/* 2. 마커가 끝났을때 왼쪽만 켜졌으면 left 반대는 right다. */
 		else if (markAccum & 0x80) {
 			markPendingType = MARKTYPE_RIGHT;  /* bit7 = 오른쪽 끝 센서 */
@@ -262,6 +274,15 @@ uint8_t Sensor_Is_Calibrated() {
 
 uint8_t Sensor_Line_Found() {
 	return lineFound;
+}
+
+/* ★ 주행 시작 전에 반드시 부른다.
+ *   라인을 놓치면 linePosition을 "직전 값 그대로" 유지하는 구조라,
+ *   초기화를 안 하면 지난 주행에서 이탈한 방향이 그대로 남아 있다가
+ *   출발하자마자 그쪽으로 확 꺾어버린다 */
+void Sensor_Reset_Line(void) {
+	linePosition = 0;
+	lineFound = 0;
 }
 
 void Sensor_Calibration() {
@@ -498,6 +519,18 @@ void Sensor_Test_State() {
 		UserInput_t btn_input = Button_Get_Input();
 		uint32_t now = HAL_GetTick();
 
+		/* ★ L / R 로 흰색/검정 판정 문턱(threshold)을 그 자리에서 바꾼다.
+		 *   8칸 박스가 즉시 반응하므로 눈으로 보면서 확정할 수 있다 */
+		if (btn_input == INPUT_CMD_L_SINGLE || btn_input == INPUT_CMD_L_HOLD) {
+			if (irData.sensorThreshold > SENSOR_THR_MIN)
+				irData.sensorThreshold--;
+			lastDraw = 0;
+		} else if (btn_input == INPUT_CMD_R_SINGLE || btn_input == INPUT_CMD_R_HOLD) {
+			if (irData.sensorThreshold < SENSOR_THR_MAX)
+				irData.sensorThreshold++;
+			lastDraw = 0;
+		}
+
 		if (Mark_Consume(&mt)) {
 			markName = MK[mt];
 			markShownAt = now;
@@ -513,8 +546,9 @@ void Sensor_Test_State() {
 
 			Sensor_Snapshot(buf, irData.sensorNormalized);
 			UI_Sensor_Cells(buf, 100, irData.sensorState, Sensor_Valid_Mask(), 1);
-			UI_Sensor_Pos(p, 3700);
+			UI_Sensor_Pos(p, SENSOR_POS_MAX);
 			UI_Sensor_Status(Sensor_Line_Found(), markName);
+			UI_Badge_Int("thr", irData.sensorThreshold, UI_C_ACCENT);
 		}
 
 		if (btn_input == INPUT_CMD_K_HOLD) {

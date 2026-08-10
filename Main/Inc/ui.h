@@ -17,6 +17,7 @@
 #define INC_UI_H_
 
 #include "main.h"
+#include <stddef.h>
 
 #define UI_W            160
 #define UI_H             80
@@ -64,6 +65,9 @@ void UI_TextBig(int16_t x, int16_t y, uint16_t fg, uint16_t bg, const char *fmt,
 /* ── 공통 부품 ───────────────────────────────── */
 void UI_Header(const char *title, const char *badge, uint16_t badgeCol);
 void UI_Badge(const char *badge, uint16_t badgeCol);      // 헤더 우측만 갱신
+void UI_Badge_Int(const char *name, int32_t v, uint16_t col);
+/* mm/s 값을 "  1.50" 형태 m/s 문자열로. 내부 계산 단위는 계속 mm/s다 */
+void UI_MS(char *dst, size_t n, int32_t mm_s);
 void UI_Hint(const char *hint);                           // 최하단 안내줄
 void UI_Gauge(int16_t x, int16_t y, int16_t w, int16_t h,
 		int32_t v, int32_t max, uint16_t c);
@@ -90,8 +94,9 @@ void UI_Cal_Stage(uint8_t stage);
 void UI_Cal_Result(uint8_t whiteHigh, uint8_t thr, uint8_t validBits, uint8_t dead);
 
 void UI_MotorSpd_Frame(void);
+/* target 0=BOTH 1=L 2=R 3=TRIM */
 void UI_MotorSpd_Update(int16_t spdL, int16_t spdR, int8_t dirL, int8_t dirR,
-		float vL, float vR, uint8_t running, uint8_t target);
+		float vL, float vR, uint8_t running, uint8_t target, int32_t trim);
 
 void UI_MotorPhase_Frame(void);
 void UI_MotorPhase_Update(uint8_t idxL, uint8_t idxR, uint8_t bitsL, uint8_t bitsR,
@@ -99,15 +104,39 @@ void UI_MotorPhase_Update(uint8_t idxL, uint8_t idxR, uint8_t bitsL, uint8_t bit
 
 /* 주행 전 설정 화면. 빌드 없이 그 자리에서 바꾼다
  * sel 0 = STEER K, 1 = SPEED, 2 = ACCEL */
-#define UI_SETUP_ROWS  3
+/* 주행 전 설정 항목. 화면엔 5줄만 보이고 선택이 내려가면 스크롤된다 */
+typedef enum {
+	UI_SET_KP = 0,
+	UI_SET_KI,
+	UI_SET_KD,
+	UI_SET_SPD,
+	UI_SET_ACC,
+	UI_SET_DEC,
+	UI_SET_OFS,
+	UI_SET_COUNT
+} UI_SetupItem_t;
+
+#define UI_SETUP_ROWS     UI_SET_COUNT
+#define UI_SETUP_VISIBLE  5
+
 void UI_Setup_Frame(const char *title);
-void UI_Setup_Update(int32_t k, int32_t spd, int32_t acc, uint8_t sel);
+void UI_Setup_Update(const int32_t *vals, uint8_t sel);
 void UI_Countdown(const char *title, int8_t sec);
 
 void UI_Drive_Frame(const char *title);
 void UI_Drive_Row(uint8_t row, int32_t dist, uint8_t mkIdx, uint8_t mkTotal,
 		const char *mkName, float vL, float vR, uint8_t lineOk);
-void UI_Drive_Result(uint8_t ok, uint8_t marks, int32_t dist, const char *hint);
+/* 주행이 왜 끝났는지. 화면에 큰 글씨로 띄운다 */
+typedef enum {
+	UI_END_COMPLETE = 0,   /* END 마커 2개 — 정상 완주      */
+	UI_END_MAP_DONE,       /* 지도 다 재생 — 2차 정상 완주  */
+	UI_END_LINE_LOST,      /* 라인 놓침                     */
+	UI_END_USER,           /* K 길게 — 사용자 취소          */
+	UI_END_LOG_FULL,       /* 마커 기록칸 가득 참           */
+} UI_EndReason_t;
+
+void UI_Drive_Result(UI_EndReason_t reason, uint8_t marks, int32_t dist,
+		const char *hint);
 
 void UI_Log_Frame(void);
 void UI_Log_Update(uint8_t i, uint8_t count, const char *name, int32_t gap);
