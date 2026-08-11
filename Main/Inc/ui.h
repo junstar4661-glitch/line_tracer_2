@@ -113,6 +113,7 @@ typedef enum {
 	UI_SET_ACC,
 	UI_SET_DEC,
 	UI_SET_OFS,
+	UI_SET_CURVE,
 	UI_SET_COUNT
 } UI_SetupItem_t;
 

@@ -525,10 +525,10 @@ void UI_Setup_Frame(const char *title) {
 }
 
 static const char *const SETUP_NAME[UI_SET_COUNT] = {
-	"P  ", "I  ", "D  ", "SPD", "ACC", "DEC", "OFS"
+	"P  ", "I  ", "D  ", "SPD", "ACC", "DEC", "OFS", "CRV"
 };
 static const char *const SETUP_UNIT[UI_SET_COUNT] = {
-	"gain", "gain", "gain", "m/s", "m/ss", "m/ss", "p zero"
+	"gain", "gain", "gain", "m/s", "m/ss", "m/ss", "p zero", "curve"
 };
 
 void UI_Setup_Update(const int32_t *vals, uint8_t sel) {

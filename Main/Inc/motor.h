@@ -41,14 +41,35 @@ uint16_t Motor_Get_ARR_R(void);
 void Motor_Test(void);
 void Motor_Phase_Test(void);
 
+/* ══ 타이머 역할 ══════════════════════════════════════════
+ *   TIM1 / TIM8   좌 / 우 모터 스텝 펄스.  ARR이 속도를 정한다
+ *   TIM7          ★제어 루프 2kHz★  기본속도 램프 + 조향 분배
+ *   TIM6          센서 스캔 8kHz.  슬롯당 IR LED 하나 점등
+ *   TIM3          ADC 트리거 지연.  LED 켜고 40us 뒤 변환
+ *   SysTick       버튼 폴링 1kHz
+ * ═══════════════════════════════════════════════════════ */
+
 void Ramp_Start(void);
 void Ramp_Stop(void);
 void Ramp_Reset(void);
-void Ramp_Set_Target(float vL, float vR);
+
+/* ── 두 가지 운전 모드 ────────────────────────────────────
+ *  MANUAL : 좌우 속도를 직접 준다. 각 바퀴가 따로 램프를 탄다
+ *           → mtr speed 화면 전용 (조향 없음)
+ *  DRIVE  : ★기본속도 하나만★ 준다. 램프도 그것만 탄다.
+ *           좌우 분배는 램프 ★뒤에서★ TIM7이 곱셈으로 만든다
+ *           → 조향이 가속도 제한을 안 받는다. 이게 이번 구조변경의 핵심
+ * ──────────────────────────────────────────────────────── */
+void Ramp_Set_Manual(float vL, float vR);
+void Ramp_Set_Speed(float v);
+
+/* TIM7이 램프를 끝낸 뒤 호출한다. 좌우 최종속도를 실제 ARR로 내보낸다
+ * (TRIM 보정이 여기서 걸린다) */
+void Motor_Set_Wheels(float vL, float vR);
 
 /* 좌우 기계 불균형 보정. 단위 0.1% (±100 = ±10%)
  *   로봇이 왼쪽으로 휘면 ＋, 오른쪽으로 휘면 －
- *   Ramp_Set_Target 안에서 걸리므로 ★주행·mtr speed 양쪽에 다 적용된다★ */
+ *   Motor_Set_Wheels 안에서 걸리므로 ★주행·mtr speed 양쪽에 다 적용된다★ */
 #define MOTOR_TRIM_MIN   (-100)
 #define MOTOR_TRIM_MAX   ( 100)
 #define MOTOR_TRIM_STEP  (   1)

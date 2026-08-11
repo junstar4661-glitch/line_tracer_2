@@ -89,6 +89,10 @@ const float sensorLinePosMm[8] = {
 
 volatile int32_t linePosition = 0;
 volatile uint8_t lineFound = 0;
+/* ★1ms 동안의 위치 변화량. D항이 이걸 쓴다.
+ *   제어루프에서 미분하지 않고 ★센서가 갱신되는 시점에★ 차분을 뜬다 */
+static volatile int32_t lineDelta = 0;
+static volatile int32_t linePrev = 0;
 
 // ---- 마크 인식 FSM (ADC ISR 안에서 1kHz 고정으로 돈다) ----
 typedef enum { MARK_IDLE, MARK_ACCUM } MarkFsmState_t;
@@ -225,7 +229,10 @@ void SENSOR_IRQ_Handler() {
 	/* 8슬롯 한 바퀴 = 1ms. 여기서 마커 FSM을 돌리면
 	 * 주행루프의 LCD 블로킹과 무관하게 판정주기가 1kHz로 고정된다 */
 	if (idx == (SENSOR_NUM - 1))
+	{
+		Sensor_Update_Position();     /* ★위치·변화량을 여기서 확정한다★ */
 		Mark_FSM_Step(irData.sensorState);
+	}
 
 	irData.index = (irData.index + 1) & 0x07;
 }
@@ -283,6 +290,8 @@ uint8_t Sensor_Line_Found() {
 void Sensor_Reset_Line(void) {
 	linePosition = 0;
 	lineFound = 0;
+	lineDelta = 0;
+	linePrev = 0;
 }
 
 void Sensor_Calibration() {
@@ -446,7 +455,9 @@ void Sensor_Test_Normalized() {
 }
 
 
-int32_t Sensor_Get_Position() {
+/* ★ADC ISR 안에서 8슬롯 한 바퀴 끝날 때마다 호출된다 (1kHz 고정).
+ *   예전엔 주행루프가 불규칙하게 불렀다 — 그래서 D를 못 썼다 */
+static void Sensor_Update_Position(void) {
 	int32_t sum_pw = 0;
 	int32_t sum_w = 0;
 
@@ -473,7 +484,18 @@ int32_t Sensor_Get_Position() {
 		lineFound = 0;   // 직전 linePosition 유지 (마지막 방향으로 계속 꺾음)
 	}
 
+	/* 1ms 동안의 변화량. 라인을 놓친 동안은 0으로 둔다
+	 * (직전값을 유지하니 차분이 0이 되는 게 맞다) */
+	lineDelta = linePosition - linePrev;
+	linePrev = linePosition;
+}
+
+int32_t Sensor_Get_Position(void) {
 	return linePosition;
+}
+
+int32_t Sensor_Get_Delta(void) {
+	return lineDelta;
 }
 
 void Mark_FSM_Reset() {

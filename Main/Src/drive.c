@@ -59,25 +59,36 @@ volatile int32_t g_pOffset = 0;
 #define P_OFFSET_FAST     50
 
 /* ── PID 조향 ─────────────────────────────────────────────────
- *   오차 e = p (라인 중심에서 벗어난 거리 x100, 단위 0.01mm)
+ *   오차 e     = 라인 중심에서 벗어난 거리 x100 (0.01mm)   ← 1kHz로 센서가 갱신
+ *   변화량 d   = 1ms 동안의 e 변화             ← ★센서 갱신 시점에 차분★
  *
- *      s = ( Kp·e  +  Ki·∫e dt  +  Kd·de/dt ) x 1e-6
+ *      s = ( Kp·e  +  Ki·∫e  +  Kd·d·100 ) x 1e-6
  *
- *   · Kp 만 쓰면 예전과 완전히 같다 (Ki=Kd=0 이 기본값)
+ *   · Ki=Kd=0 이면 예전 P제어와 완전히 같다
  *   · 라인트레이서에서 ★I는 보통 해롭다.★ 긴 코너에서 적분이 쌓여
  *     코너 탈출 때 반대로 튄다. 0으로 두는 게 정석이다
  *   · D는 진동을 눌러줘서 Kp를 더 올릴 수 있게 해준다.
  *     "Kp 올리면 사행 / 내리면 이탈"이 될 때만 켜라
  *
- *   ★제어 주기를 2ms로 고정한다.★ D는 미분이라 주기가 흔들리면 값이 튄다.
- *     예전엔 루프가 도는 대로(수 kHz, LCD 그릴 땐 멈춤) 불규칙했다 */
-#define PID_PERIOD_MS      2
-#define PID_D_LPF          0.2f      /* D 저역통과. p가 계단식이라 날것은 스파이크 */
+ *   ★제어는 TIM7 인터럽트가 2kHz로 돌린다.★ 폴링이 아니다.
+ *     화면을 그리든 버튼을 읽든 제어 주기는 흔들리지 않는다 */
 #define PID_I_CLAMP    30000.0f      /* 적분 폭주 백스톱 */
+#define PID_D_SCALE       100.0f     /* D 게인을 P와 비슷한 자릿수로 맞추는 배율 */
 
 volatile int32_t g_kp = 180;
 volatile int32_t g_ki = 0;
 volatile int32_t g_kd = 0;
+
+/* ★곡률 자동 감속★ — 많이 꺾을수록 알아서 느려진다.
+ *   조향을 램프 밖으로 뺐기 때문에 바퀴 속도가 급변할 수 있는데,
+ *   이게 그걸 억제하는 안전장치이자 코너 통과 성능 자체를 올려준다.
+ *      v_reduced = v x CC / (|s|x1000 + CC)
+ *   작을수록 많이 감속. 크면 거의 감속 안 함 */
+volatile int32_t g_curveCoef = 1000;
+#define CURVE_MIN        100
+#define CURVE_MAX       5000
+#define CURVE_STEP       100
+#define CURVE_STEP_FAST  500
 
 #define GAIN_P_MAX      2000
 #define GAIN_I_MAX       500
@@ -85,11 +96,9 @@ volatile int32_t g_kd = 0;
 #define GAIN_STEP         10     /* L·R 짧게 */
 #define GAIN_STEP_FAST    50     /* L·R 길게 */
 
+static volatile uint8_t ctrlOn = 0;   /* 0이면 조향 없이 직진만 */
 static float   pidI = 0.0f;
-static float   pidD = 0.0f;
-static int32_t pidPrevE = 0;
 static float   pidLastS = 0.0f;
-static uint8_t pidFirst = 1;
 
 /* ★진단용★ 주행 중 오차를 화면에 그대로 띄운다.
  *   pNow   = 지금 오차 (보정 후)
@@ -99,10 +108,13 @@ volatile int32_t g_pStart = 0;
 
 static void Drive_PID_Reset(void) {
 	pidI = 0.0f;
-	pidD = 0.0f;
-	pidPrevE = 0;
 	pidLastS = 0.0f;
-	pidFirst = 1;      /* 첫 호출에서 D가 튀지 않게 */
+	g_pStart = 0;
+	g_pNow = 0;
+}
+
+void Drive_Control_Enable(uint8_t on) {
+	ctrlOn = on;
 }
 
 #define MARK_LOG_MAX    50
@@ -119,12 +131,14 @@ static const char *MARK_NAME[] = { "LEFT", "RIGHT", "END", "CROSS" };
 /* ★ 안전 정지: 라인이탈/사용자취소는 램프 없이 즉시 전류 차단.
  *   정상 완주(트랙 끝)만 부드럽게 감속 — 이미 트랙 안이라 안전함 */
 static void Drive_Stop_Immediate(void) {
+	Drive_Control_Enable(0);      /* 조향 끄고 */
 	Ramp_Stop();
 	Motor_Stop();
 }
 
 static void Drive_Stop_Graceful(void) {
-	Ramp_Set_Target(0, 0);
+	Drive_Control_Enable(0);      /* 감속 중엔 조향 안 한다 */
+	Ramp_Set_Speed(0);
 	HAL_Delay(500);
 	Ramp_Stop();
 	Motor_Stop();
@@ -192,9 +206,13 @@ static void Drive_Setup(const char *title, volatile int32_t *spd) {
 				Ramp_Set_Decel(Ramp_Get_Decel()
 						+ dir * (fast ? RAMP_ACCEL_FAST : RAMP_ACCEL_STEP));
 				break;
-			default:
+			case UI_SET_OFS:
 				g_pOffset = clampi(g_pOffset + dir * (fast ? P_OFFSET_FAST
 						: P_OFFSET_STEP), P_OFFSET_MIN, P_OFFSET_MAX);
+				break;
+			default:
+				g_curveCoef = clampi(g_curveCoef + dir * (fast ? CURVE_STEP_FAST
+						: CURVE_STEP), CURVE_MIN, CURVE_MAX);
 				break;
 			}
 		}
@@ -205,7 +223,8 @@ static void Drive_Setup(const char *title, volatile int32_t *spd) {
 		vals[UI_SET_SPD] = *spd;
 		vals[UI_SET_ACC] = Ramp_Get_Accel();
 		vals[UI_SET_DEC] = Ramp_Get_Decel();
-		vals[UI_SET_OFS] = g_pOffset;
+		vals[UI_SET_OFS]   = g_pOffset;
+		vals[UI_SET_CURVE] = g_curveCoef;
 
 		for (uint8_t i = 0; i < UI_SET_COUNT; i++)
 			if (vals[i] != drawn[i]) { changed = 1; drawn[i] = vals[i]; }
@@ -268,42 +287,55 @@ static uint8_t Drive_Precheck(const char *title, volatile int32_t *spd) {
 	return 1;
 }
 
-/* ★ PID_PERIOD_MS 주기로만 불러라. dt가 고정이어야 D가 의미가 있다 */
-static void Drive_Steer(float v_base) {
-	const float dt = (float) PID_PERIOD_MS / 1000.0f;
-	int32_t e = Sensor_Get_Position() - g_pOffset;   /* 영점 보정된 오차 */
-	float dRaw, s;
 
-	/* ── I: 조향이 이미 한계면 더 안 쌓는다 (적분 와인드업 방지) ── */
+/* ══ 제어 1틱 · TIM7이 2kHz로 부른다 ═══════════════════════
+ *
+ *   들어오는 vBase = 램프를 이미 통과한 기본속도
+ *   여기서 하는 일 : PID → 곡률 감속 → 좌우 분배 → 실제 출력
+ *
+ *   ★조향은 램프를 안 탄다.★ 그래서 ACC가 낮아도 코너에서 즉시 꺾인다.
+ *   대신 곡률 감속이 바퀴 속도 급변을 눌러준다
+ * ═════════════════════════════════════════════════════════ */
+void Drive_Control_Tick(float vBase) {
+	int32_t e, d;
+	float s, vRed;
+
+	if (!ctrlOn) {                 /* 조향 꺼짐 = 그냥 직진 */
+		Motor_Set_Wheels(vBase, vBase);
+		return;
+	}
+
+	e = Sensor_Get_Position() - g_pOffset;   /* 영점 보정된 오차 */
+	d = Sensor_Get_Delta();                  /* 센서 갱신 시점에 이미 뜬 차분 */
+
+	if (g_pStart == 0 && e != 0)
+		g_pStart = e;              /* 출발 순간의 오차를 박제 (진단용) */
+	g_pNow = e;
+
+	/* I: 조향이 이미 한계면 더 안 쌓는다 (적분 와인드업 방지) */
 	if (fabsf(pidLastS) < STEER_MAX)
-		pidI += (float) e * dt;
+		pidI += (float) e * 0.0005f;          /* 2kHz → 틱당 0.5ms */
 	if (pidI >  PID_I_CLAMP) pidI =  PID_I_CLAMP;
 	if (pidI < -PID_I_CLAMP) pidI = -PID_I_CLAMP;
 
-	/* ── D: 1차 저역통과를 건다 ──
-	 *   ★첫 호출에는 이전값이 없다.★ 0으로 두면 de/dt = e/0.002 로
-	 *   500배 뻥튀기된 스파이크가 나가서 출발하자마자 확 꺾인다 */
-	if (pidFirst) {
-		pidPrevE = e;
-		g_pStart = e;          /* 출발 순간의 오차를 박제해둔다 */
-		pidFirst = 0;
-	}
-	g_pNow = e;
-	dRaw = (float) (e - pidPrevE) / dt;
-	pidD += (dRaw - pidD) * PID_D_LPF;
-	pidPrevE = e;
-
 	s = ((float) g_kp * (float) e
 	   + (float) g_ki * pidI
-	   + (float) g_kd * pidD) * 0.000001f;
+	   + (float) g_kd * (float) d * PID_D_SCALE) * 0.000001f;
 
 	if (s > STEER_MAX)
 		s = STEER_MAX;
 	else if (s < -STEER_MAX)
 		s = -STEER_MAX;
-
 	pidLastS = s;
-	Ramp_Set_Target(v_base * (1.0f + s), v_base * (1.0f - s));
+
+	/* ★곡률 자동 감속★ — 많이 꺾을수록 느려진다 */
+	{
+		float a = (s < 0) ? -s : s;
+		float cc = (float) g_curveCoef;
+		vRed = vBase * cc / (a * 1000.0f + cc);
+	}
+
+	Motor_Set_Wheels(vRed * (1.0f + s), vRed * (1.0f - s));
 }
 
 static void Drive_Log_Review(void) {
@@ -371,7 +403,6 @@ void Drive_First() {
 	int32_t lostAtDist = 0;
 	uint8_t lostFlag = 0;
 	uint32_t lastRow = 0;
-	uint32_t lastPid = 0;
 	uint8_t row = 0;
 	UI_EndReason_t reason = UI_END_COMPLETE;
 	const char *lastMarkName = "-";
@@ -387,6 +418,8 @@ void Drive_First() {
 	Ramp_Reset();
 	Sensor_Start();
 	Motor_Start();
+	Ramp_Set_Speed(0);            /* DRIVE 모드로 전환 + 기본속도 0에서 시작 */
+	Drive_Control_Enable(1);      /* ★여기서부터 TIM7이 조향한다★ */
 	Ramp_Start();
 	UI_Drive_Frame("DRIVE 1st");
 
@@ -395,10 +428,8 @@ void Drive_First() {
 
 		/* ── 순수 주행 로직. 블로킹 없음, GPIO 읽기 없음 ────── */
 		/* ★PID는 2ms 고정 주기로만 돈다. D가 미분이라 주기가 흔들리면 안 된다 */
-		if ((now - lastPid) >= PID_PERIOD_MS) {
-			lastPid = now;
-			Drive_Steer((float) g_drive1Speed);
-		}
+		/* ★조향은 TIM7(2kHz)이 한다. 루프는 목표속도만 알려준다★ */
+		Ramp_Set_Speed((float) g_drive1Speed);
 
 		if (Sensor_Line_Found()) {
 			lostFlag = 0;              /* 라인 보임 → 리셋 */
@@ -478,7 +509,6 @@ void Drive_Second() {
 	int32_t lostAtDist = 0;
 	uint8_t lostFlag = 0;
 	uint32_t lastRow = 0;
-	uint32_t lastPid = 0;
 	uint8_t row = 0;
 	UI_EndReason_t reason = UI_END_MAP_DONE;
 	MarkType_t mt;
@@ -493,6 +523,8 @@ void Drive_Second() {
 	Ramp_Reset();
 	Sensor_Start();
 	Motor_Start();
+	Ramp_Set_Speed(0);            /* DRIVE 모드로 전환 + 기본속도 0에서 시작 */
+	Drive_Control_Enable(1);      /* ★여기서부터 TIM7이 조향한다★ */
 	Ramp_Start();
 	UI_Drive_Frame("DRIVE 2nd");
 
@@ -519,10 +551,7 @@ void Drive_Second() {
 			v_target = v_turn;
 		}
 
-		if ((now - lastPid) >= PID_PERIOD_MS) {
-			lastPid = now;
-			Drive_Steer(v_target);
-		}
+		Ramp_Set_Speed(v_target);
 
 		if (Sensor_Line_Found()) {
 			lostFlag = 0;              /* 라인 보임 → 리셋 */

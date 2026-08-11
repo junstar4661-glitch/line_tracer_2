@@ -12,7 +12,8 @@
 #include "gpio.h"
 #include "button.h"
 #include "dac.h"
-#include "ui.h"   /* 화면은 전부 ui.c가 그린다 */
+#include "ui.h"      /* 화면은 전부 ui.c가 그린다 */
+#include "drive.h"   /* Drive_Control_Tick — TIM7이 매 틱 부른다 */
 
 #define TREAD_MM         167.0f
 #define WHEEL_DIA_MM      52.0648f
@@ -324,11 +325,36 @@ int32_t Motor_Get_Trim(void) {
 	return motorTrim;
 }
 
-void Ramp_Set_Target(float vL, float vR) {
+/* ── 운전 모드 ─────────────────────────────────────────── */
+typedef enum { RAMP_MANUAL = 0, RAMP_DRIVE } RampMode_t;
+static volatile RampMode_t rampMode = RAMP_MANUAL;
+
+static volatile float vBaseTarget = 0.0f;   /* DRIVE 모드의 기본속도 목표 */
+static volatile float vBaseCur = 0.0f;      /* 램프를 탄 현재 기본속도   */
+
+/* ★MANUAL 모드의 램프 상태. 출력(vCurL/R)과 반드시 분리해야 한다.
+ *   같이 쓰면 TRIM이 매 틱 누적 곱해져서 폭주한다 */
+static volatile float vRampL = 0.0f, vRampR = 0.0f;
+
+void Ramp_Set_Manual(float vL, float vR) {
+	rampMode = RAMP_MANUAL;
+	vTargetL = vL;
+	vTargetR = vR;
+}
+
+void Ramp_Set_Speed(float v) {
+	rampMode = RAMP_DRIVE;
+	vBaseTarget = v;
+}
+
+/* 좌우 최종속도를 실제 타이머로 내보낸다. TRIM은 여기서 한 번만 걸린다 */
+void Motor_Set_Wheels(float vL, float vR) {
 	float t = (float) motorTrim * 0.001f;
 
-	vTargetL = vL * (1.0f + t);
-	vTargetR = vR * (1.0f - t);
+	vCurL = vL * (1.0f + t);
+	vCurR = vR * (1.0f - t);
+	Velocity_To_ARR_L(vCurL);
+	Velocity_To_ARR_R(vCurR);
 }
 
 void Ramp_Reset() {
@@ -336,6 +362,11 @@ void Ramp_Reset() {
 	vTargetR = 0;
 	vCurL = 0;
 	vCurR = 0;
+	vBaseTarget = 0;
+	vBaseCur = 0;
+	vRampL = 0;
+	vRampR = 0;
+	rampMode = RAMP_MANUAL;
 }
 
 volatile HAL_StatusTypeDef ramp_start_result;
@@ -349,45 +380,45 @@ void Ramp_Stop() {
 	HAL_TIM_Base_Stop_IT(&htim7);
 }
 
-/* ★★ 좌우가 ★같은 시각에★ 목표에 도착하게 만든다 ★★
+/* 한 축을 목표 쪽으로 한 틱만큼 옮긴다 */
+__STATIC_INLINE float Ramp_Step_One(float cur, float target, float acc, float dec) {
+	float d = (fabsf(target) > fabsf(cur)) ? acc : dec;   /* 0에서 멀어지면 가속 */
+
+	if (fabsf(target - cur) < d)
+		return target;
+	return cur + ((target > cur) ? d : -d);
+}
+
+/* ══ 제어 루프 · 2kHz ═══════════════════════════════════════
  *
- *   예전에는 좌/우를 각각 독립으로 제한했다. 그러면 출발할 때
- *      목표 L1540 / R1460  →  둘 다 0에서 같은 기울기로 올라감
- *      → 0.3초 동안 좌우가 ★똑같다 = 조향이 0★
- *      → 그동안 45cm를 그냥 직진하며 라인에서 벗어남
- *      → 마지막에 갑자기 차동이 생기면서 ★확 튄다★
+ *   ★이번 구조변경의 핵심★
+ *   예전에는 좌/우 목표속도를 각각 만들어 ★둘 다 램프에 통과★시켰다.
+ *   그러면 조향이 "직진 탈조 방지용" 가속도 제한기에 갇혀서
+ *   ACC가 낮으면 코너에서 아무리 P를 올려도 못 꺾었다.
  *
- *   해결: 더 오래 걸리는 쪽에 시간을 맞추고, 짧은 쪽은 그 시간에 나눠서 간다.
- *         그러면 가속 중에도 좌우 비율(=조향)이 계속 유지된다 */
+ *   이제는 ★기본속도 하나만 램프★하고, 좌우 분배는 그 뒤에서 곱셈으로 만든다.
+ *   조향은 가속도 제한을 안 받는다. 대신 곡률에 따라 자동 감속해서
+ *   바퀴 속도가 급변하는 걸 억제한다 (Drive_Control_Tick 안에 있음).
+ * ═════════════════════════════════════════════════════════ */
 void HAL_TIM7_IRQ_Handler() {
 	const float acc = rampAccelStep;
 	const float dec = rampDecelStep;
-	float dL, dR, rL, rR, tL, tR, t;
 
 	ramp_tick_count++;
 
-	dL = vTargetL - vCurL;
-	dR = vTargetR - vCurR;
-
-	/* 바퀴별로 가속인지 감속인지 (0에서 멀어지면 가속) */
-	rL = (fabsf(vTargetL) > fabsf(vCurL)) ? acc : dec;
-	rR = (fabsf(vTargetR) > fabsf(vCurR)) ? acc : dec;
-
-	/* 각자 목표까지 몇 틱 걸리나 */
-	tL = fabsf(dL) / rL;
-	tR = fabsf(dR) / rR;
-	t  = (tL > tR) ? tL : tR;      /* 오래 걸리는 쪽에 맞춘다 */
-
-	if (t <= 1.0f) {
-		vCurL = vTargetL;          /* 이번 틱에 둘 다 도착 */
-		vCurR = vTargetR;
-	} else {
-		vCurL += dL / t;           /* 남은 거리를 같은 시간에 나눠 간다 */
-		vCurR += dR / t;
+	if (rampMode == RAMP_MANUAL) {
+		/* mtr speed 화면: 좌우를 직접, 각자 램프.
+		 * 출력은 Motor_Set_Wheels로 보내야 ★TRIM이 걸린다★
+		 * (TRIM을 여기서 시험하니까 반드시 통과시켜야 한다) */
+		vRampL = Ramp_Step_One(vRampL, vTargetL, acc, dec);
+		vRampR = Ramp_Step_One(vRampR, vTargetR, acc, dec);
+		Motor_Set_Wheels(vRampL, vRampR);
+		return;
 	}
 
-	Velocity_To_ARR_L(vCurL);
-	Velocity_To_ARR_R(vCurR);
+	/* DRIVE 모드: 기본속도만 램프 → 조향은 drive.c가 램프 뒤에서 곱한다 */
+	vBaseCur = Ramp_Step_One(vBaseCur, vBaseTarget, acc, dec);
+	Drive_Control_Tick(vBaseCur);
 }
 
 void Motor_Test() {
@@ -462,10 +493,10 @@ void Motor_Test() {
 		if (running) {
 			float rL = (target != 2) ? (dirL * spdL) : 0;
 			float rR = (target != 1) ? (dirR * spdR) : 0;
-			Ramp_Set_Target(rL, rR);
+			Ramp_Set_Manual(rL, rR);
 		}
 		else {
-			Ramp_Set_Target(0, 0);
+			Ramp_Set_Manual(0, 0);
 		}
 
 		if ((now - lastDraw) >= 100) {
@@ -481,7 +512,7 @@ void Motor_Test() {
 		}
 	}
 
-	Ramp_Set_Target(0, 0);
+	Ramp_Set_Manual(0, 0);
 	HAL_Delay(500);
 	Ramp_Stop();
 	Motor_Stop();
