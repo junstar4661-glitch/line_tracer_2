@@ -94,26 +94,23 @@ void UI_Cal_Stage(uint8_t stage);
 void UI_Cal_Result(uint8_t whiteHigh, uint8_t thr, uint8_t validBits, uint8_t dead);
 
 void UI_MotorSpd_Frame(void);
-/* target 0=BOTH 1=L 2=R 3=TRIM */
+/* target 0=BOTH 1=L 2=R */
 void UI_MotorSpd_Update(int16_t spdL, int16_t spdR, int8_t dirL, int8_t dirR,
-		float vL, float vR, uint8_t running, uint8_t target, int32_t trim);
+		float vL, float vR, uint8_t running, uint8_t target);
 
 void UI_MotorPhase_Frame(void);
 void UI_MotorPhase_Update(uint8_t idxL, uint8_t idxR, uint8_t bitsL, uint8_t bitsR,
 		uint8_t coilOn, uint8_t target);
 
-/* 주행 전 설정 화면. 빌드 없이 그 자리에서 바꾼다
- * sel 0 = STEER K, 1 = SPEED, 2 = ACCEL */
-/* 주행 전 설정 항목. 화면엔 5줄만 보이고 선택이 내려가면 스크롤된다 */
+/* 주행 전 설정 항목. 화면엔 5줄만 보이고 선택이 내려가면 스크롤된다.
+ * 게인은 SI 단위다 — Kp [1/m], Kd [s/m] */
 typedef enum {
 	UI_SET_KP = 0,
-	UI_SET_KI,
 	UI_SET_KD,
 	UI_SET_SPD,
 	UI_SET_ACC,
 	UI_SET_DEC,
-	UI_SET_OFS,
-	UI_SET_CURVE,
+	UI_SET_FIT,
 	UI_SET_COUNT
 } UI_SetupItem_t;
 
@@ -121,7 +118,8 @@ typedef enum {
 #define UI_SETUP_VISIBLE  5
 
 void UI_Setup_Frame(const char *title);
-void UI_Setup_Update(const int32_t *vals, uint8_t sel);
+void UI_Setup_Update(int32_t kp, int32_t kd, int32_t spd, int32_t acc,
+		int32_t dec, int32_t fitInDist, uint8_t sel);
 void UI_Countdown(const char *title, int8_t sec);
 
 void UI_Drive_Frame(const char *title);
@@ -133,13 +131,21 @@ typedef enum {
 	UI_END_MAP_DONE,       /* 지도 다 재생 — 2차 정상 완주  */
 	UI_END_LINE_LOST,      /* 라인 놓침                     */
 	UI_END_USER,           /* K 길게 — 사용자 취소          */
+	UI_END_MISMATCH,       /* 2차: 지도와 마커 종류가 다름  */
 	UI_END_LOG_FULL,       /* 마커 기록칸 가득 참           */
 } UI_EndReason_t;
 
 void UI_Drive_Result(UI_EndReason_t reason, uint8_t marks, int32_t dist,
 		const char *hint);
 
-void UI_Log_Frame(void);
-void UI_Log_Update(uint8_t i, uint8_t count, const char *name, int32_t gap);
+/* ── 로그 표 ────────────────────────────────────────────
+ *   한 화면에 5줄. 선택이 창 밖으로 나가면 스크롤된다.
+ *   drive.c 가 슬롯 5개를 직접 돌려서 그린다 (ui.c는 마커 구조를 모른다) */
+#define UI_LOG_VISIBLE  5
+/* title = "LOG"(마커 보기) 또는 "SEG"(구간 보기). R 꾹으로 전환한다 */
+void UI_Log_Frame(const char *title);
+void UI_Log_Head(uint8_t sel, uint8_t total);
+void UI_Log_Row(uint8_t slot, int16_t idx, const char *name, int32_t gap,
+		uint8_t selected);
 
 #endif /* INC_UI_H_ */

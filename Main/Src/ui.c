@@ -16,7 +16,6 @@
 #include "custom_lcd.h"
 #include "st7735_lcd.h"
 #include "st7735.h"
-#include "drive.h"      /* g_pNow / g_pStart — 진단 숫자를 화면에 띄운다 */
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -414,9 +413,8 @@ void UI_MotorSpd_Frame(void) {
 }
 
 void UI_MotorSpd_Update(int16_t spdL, int16_t spdR, int8_t dirL, int8_t dirR,
-		float vL, float vR, uint8_t running, uint8_t target, int32_t trim) {
-	const char *tn = (target == 0) ? "BOTH" : (target == 1) ? "L"
-				   : (target == 2) ? "R"    : "TRIM";
+		float vL, float vR, uint8_t running, uint8_t target) {
+	const char *tn = (target == 0) ? "BOTH" : (target == 1) ? "L" : "R";
 	char buf[28], mL[8], mR[8];
 	float aL = (vL < 0) ? -vL : vL;
 	float aR = (vR < 0) ? -vR : vR;
@@ -433,10 +431,6 @@ void UI_MotorSpd_Update(int16_t spdL, int16_t spdR, int8_t dirL, int8_t dirR,
 			"L%-4s", (dirL > 0) ? "FWD" : "REV");
 	UI_Text(75, 29, (dirR > 0) ? UI_C_OK : UI_C_WARN, UI_C_BG,
 			"R%-4s", (dirR > 0) ? "FWD" : "REV");
-
-	/* 좌우 보정값. TRIM 모드일 때 노랗게 강조된다 */
-	UI_Text(112, 29, (target == 3) ? UI_C_ACCENT : UI_C_DIM, UI_C_BG,
-			"T%+4ld", (long) trim);
 
 	UI_MS(mL, sizeof(mL), (int32_t) vL);
 	UI_MS(mR, sizeof(mR), (int32_t) vR);
@@ -525,15 +519,43 @@ void UI_Setup_Frame(const char *title) {
 }
 
 static const char *const SETUP_NAME[UI_SET_COUNT] = {
-	"P  ", "I  ", "D  ", "SPD", "ACC", "DEC", "OFS", "CRV"
+	"Kp ", "Kd ", "SPD", "ACC", "DEC", "FIT"
 };
 static const char *const SETUP_UNIT[UI_SET_COUNT] = {
-	"gain", "gain", "gain", "m/s", "m/ss", "m/ss", "p zero", "curve"
+	"1/m", "s/m", "m/s", "m/ss", "m/ss", "mm"
 };
 
-void UI_Setup_Update(const int32_t *vals, uint8_t sel) {
+/* x1e3 정수를 소수 문자열로. 14500 → "14.500" (dec=3) */
+static void ui_fixed(char *dst, size_t n, int32_t v1e3, uint8_t dec) {
+	int32_t a = (v1e3 < 0) ? -v1e3 : v1e3;
+	int32_t div = 1;
+	uint8_t drop = (uint8_t) (3u - dec);
+
+	while (drop--) div *= 10;
+	a /= div;
+
+	if (dec == 0)
+		snprintf(dst, n, "%s%ld", (v1e3 < 0) ? "-" : " ", (long) a);
+	else if (dec == 1)
+		snprintf(dst, n, "%s%ld.%01ld", (v1e3 < 0) ? "-" : " ",
+				(long) (a / 10), (long) (a % 10));
+	else
+		snprintf(dst, n, "%s%ld.%02ld", (v1e3 < 0) ? "-" : " ",
+				(long) (a / 100), (long) (a % 100));
+}
+
+void UI_Setup_Update(int32_t kp, int32_t kd, int32_t spd, int32_t acc,
+		int32_t dec, int32_t fitInDist, uint8_t sel) {
+	int32_t vals[UI_SET_COUNT];
 	uint8_t top;
-	char b[10], badge[8];
+	char b[12], badge[8];
+
+	vals[UI_SET_KP]  = kp;
+	vals[UI_SET_KD]  = kd;
+	vals[UI_SET_SPD] = spd;
+	vals[UI_SET_ACC] = acc;
+	vals[UI_SET_DEC] = dec;
+	vals[UI_SET_FIT] = fitInDist;
 
 	/* 선택이 보이는 창 아래로 내려가면 창을 끌어내린다 */
 	top = (sel < UI_SETUP_VISIBLE) ? 0
@@ -545,12 +567,20 @@ void UI_Setup_Update(const int32_t *vals, uint8_t sel) {
 	for (uint8_t r = 0; r < UI_SETUP_VISIBLE; r++) {
 		uint8_t i = (uint8_t) (top + r);
 
-		if (i == UI_SET_SPD)
-			UI_MS(b, sizeof(b), vals[i]);
-		else if (i == UI_SET_OFS)
-			snprintf(b, sizeof(b), "%+5ld", (long) vals[i]);
-		else
+		switch (i) {
+		case UI_SET_KP:                                   /* x1e3, 1/m   */
+			ui_fixed(b, sizeof(b), vals[i], 1);  break;
+		case UI_SET_KD:                                   /* x1e3, s/m   */
+			ui_fixed(b, sizeof(b), vals[i], 2);  break;
+		case UI_SET_SPD:                                  /* mm/s → m/s  */
+			UI_MS(b, sizeof(b), vals[i]);        break;
+		case UI_SET_ACC:
+		case UI_SET_DEC:                                  /* mm/s² → m/s² */
+			ui_fixed(b, sizeof(b), vals[i], 1);  break;
+		default:                                          /* FIT: mm 그대로 */
 			snprintf(b, sizeof(b), "%5ld", (long) vals[i]);
+			break;
+		}
 
 		ui_setup_row(r, (uint8_t) (i == sel), SETUP_NAME[i], b, SETUP_UNIT[i]);
 	}
@@ -589,9 +619,12 @@ void UI_Drive_Row(uint8_t row, int32_t dist, uint8_t mkIdx, uint8_t mkTotal,
 		break;
 
 	case 1:
-		/* ★진단★ 마커 정보 + 지금 오차 p. 출발 튐을 눈으로 보려고 넣었다 */
-		snprintf(buf, sizeof(buf), "mk%-2d %-6s p%+5ld",
-				mkIdx, mkName ? mkName : "-", (long) g_pNow);
+		if (mkTotal)
+			snprintf(buf, sizeof(buf), "mk %d/%d %s", mkIdx, mkTotal,
+					mkName ? mkName : "-");
+		else
+			snprintf(buf, sizeof(buf), "mk %d %s", mkIdx,
+					mkName ? mkName : "-");
 		ui_row(4, DRV_MARK_Y, UI_C_ACCENT, UI_C_BG, 25, buf);
 		break;
 
@@ -642,6 +675,8 @@ void UI_Drive_Result(UI_EndReason_t reason, uint8_t marks, int32_t dist,
 		big = "LINE LOST"; why = "no line for 50ms";     col = UI_C_BAD;  ok = 0; break;
 	case UI_END_USER:
 		big = "USER STOP"; why = "K-hold pressed";       col = UI_C_WARN; ok = 0; break;
+	case UI_END_MISMATCH:
+		big = "MAP DIFF";  why = "marker != 1st run map"; col = UI_C_BAD; ok = 0; break;
 	default:
 		big = "LOG FULL";  why = "mark buffer overflow"; col = UI_C_WARN; ok = 0; break;
 	}
@@ -661,9 +696,6 @@ void UI_Drive_Result(UI_EndReason_t reason, uint8_t marks, int32_t dist,
 	snprintf(buf, sizeof(buf), "mk%-3d %5ldmm", marks, (long) dist);
 	ui_puts(3, RES_NUM_Y, UI_C_VALUE, UI_C_BG, 16, buf);
 
-	/* ★출발 순간의 오차★ — 출발 튐 진단의 핵심 숫자 */
-	snprintf(buf, sizeof(buf), "p at start %+5ld", (long) g_pStart);
-	ui_row(3, RES_WHY_Y + 12, UI_C_ACCENT, UI_C_BG, 26, buf);
 
 	if (hint)
 		UI_Hint(hint);
@@ -673,21 +705,44 @@ void UI_Drive_Result(UI_EndReason_t reason, uint8_t marks, int32_t dist,
  *  LOG REVIEW
  * ──────────────────────────────────────────────── */
 
-void UI_Log_Frame(void) {
+/* ── 로그 표 ────────────────────────────────────────
+ *  y 0..12   헤더 + 현재위치 배지
+ *  y 15..74  5줄 x 12px
+ *
+ *    1 LEFT      0 mm
+ *    2 CROSS   842 mm
+ *  ▌ 3 END     310 mm     ← 선택된 줄
+ * ──────────────────────────────────────────────── */
+#define LOG_Y0     15
+#define LOG_ROW_H  12
+
+void UI_Log_Frame(const char *title) {
 	UI_Clear();
-	UI_Header("LOG REVIEW", NULL, UI_C_LABEL);
-	UI_Hint("L/R: move   K-hold: exit");
+	UI_Header(title, NULL, UI_C_LABEL);
 }
 
-void UI_Log_Update(uint8_t i, uint8_t count, const char *name, int32_t gap) {
-	char buf[24];
-
-	snprintf(buf, sizeof(buf), "%d/%d", i + 1, count);
-	UI_Badge(buf, UI_C_VALUE);
-
-	/* %-10s 로 폭을 고정해서 이전 항목 글자가 남지 않게 한다 */
-	UI_TextBig(4, 20, UI_C_ACCENT, UI_C_BG, "%-10s", name);
-
-	UI_Text(4, 44, UI_C_LABEL, UI_C_BG, "gap");
-	UI_Text(30, 44, UI_C_VALUE, UI_C_BG, "%-8ld mm", (long) gap);
+void UI_Log_Head(uint8_t sel, uint8_t total) {
+	char b[10];
+	snprintf(b, sizeof(b), "%d/%d", sel + 1, total);
+	UI_Badge(b, UI_C_ACCENT);
 }
+
+/* idx < 0 이면 빈 줄 (목록 끝을 넘어간 슬롯) */
+void UI_Log_Row(uint8_t slot, int16_t idx, const char *name, int32_t gap,
+		uint8_t selected) {
+	int16_t y = (int16_t) (LOG_Y0 + slot * LOG_ROW_H);
+	uint16_t bg = selected ? UI_C_HEAD : UI_C_BG;
+	char buf[28];
+
+	UI_Fill(0, y, UI_W, LOG_ROW_H, bg);
+	if (idx < 0)
+		return;
+
+	if (selected)
+		UI_Fill(0, y, 3, LOG_ROW_H, UI_C_ACCENT);
+
+	snprintf(buf, sizeof(buf), "%2d %-5s %5ld mm",
+			(int) (idx + 1), name ? name : "-", (long) gap);
+	ui_puts(6, y, selected ? UI_C_VALUE : UI_C_LABEL, bg, 12, buf);
+}
+

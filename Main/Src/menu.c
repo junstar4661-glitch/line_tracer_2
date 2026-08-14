@@ -1,12 +1,3 @@
-/*
- * menu.c
- *
- *  Created on: 2026. 6. 24.
- *      Author: kth59
- *
- *  ?�면?� ui.c가 그린?? ?�기????�� 목록�??�택 ?�태�?관리한??
- */
-
 #include "menu.h"
 #include "sensor.h"
 #include "motor.h"

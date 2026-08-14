@@ -12,6 +12,7 @@
 #include "adc.h"
 #include "tim.h"
 #include "button.h"
+#include "motor.h"   /* Distance_Get_Mm — 마커 시작 지점을 latch 한다 */
 #include "ui.h"   /* 화면은 전부 ui.c가 그린다. 여기엔 좌표도 색도 없다 */
 
 #define SENSOR_NUM 8
@@ -32,9 +33,22 @@
 #define SENSOR_THR_MIN    10
 #define SENSOR_THR_MAX    90
 
-/* 마커 글리치 가드. 마커 FSM은 ADC ISR에서 1kHz로 도므로 단위가 곧 ms다 */
-#define MARK_MIN_MS       8     // 이보다 짧은 발화는 노이즈로 버린다
-#define MARK_GAP_MIN_MS   40    // 확정 직후 이 시간 안의 재발화는 채터링으로 무시
+/* Marker timing is measured on complete 8-sensor scan frames. */
+#define SENSOR_FRAME_PERIOD_US  2000u /* TIM6 4 kHz / 8 sensor slots */
+#define MARK_MIN_WIDTH_US       8000u
+#define MARK_GAP_US            40000u
+/* 교차로 대각 통과 시 좌우 팔의 앞뒤 간격. 센서바 폭 × tan(진입각) 이다.
+ * 70mm 바를 30도로 밟으면 40mm. 그보다 넉넉하되, 진짜로 다른 마커끼리의
+ * 최소 간격보다는 확실히 짧아야 한다 */
+#define MARK_MERGE_MM            50.0f
+#define MARK_MERGE_US_MIN        6000u
+#define MARK_MERGE_US_MAX       80000u
+#define MARK_MERGE_US_DEFAULT   40000u
+#define MARK_PRETRIGGER_FRAMES     4u  /* 8 ms at the current 2 ms frame rate */
+/* CROSS is confirmed by both marker sensors plus four or more line sensors.
+ * Requiring five middle sensors made a valid cross fall through to END when
+ * one sensor was on the black/white boundary. */
+#define MARK_CROSS_MIDDLE_MIN       4u
 
 typedef struct {
 	GPIO_TypeDef *Port;
@@ -83,27 +97,60 @@ const float sensorLinePosMm[8] = {
     0
 };
 
-/* Sensor_Get_Position이 돌려주는 p의 최대 절댓값.
- * 제일 바깥 라인센서 37.5mm x 100 = 3750 */
-#define SENSOR_POS_MAX   3750
-
 volatile int32_t linePosition = 0;
 volatile uint8_t lineFound = 0;
-/* ★1ms 동안의 위치 변화량. D항이 이걸 쓴다.
- *   제어루프에서 미분하지 않고 ★센서가 갱신되는 시점에★ 차분을 뜬다 */
-static volatile int32_t lineDelta = 0;
-static volatile int32_t linePrev = 0;
 
-// ---- 마크 인식 FSM (ADC ISR 안에서 1kHz 고정으로 돈다) ----
+/* 8슬롯 스캔이 한 바퀴 돌 때마다 1이 된다. 제어기가 소비하면 0으로 */
+static volatile uint8_t sensorFrameReady = 0;
+
+// ---- Marker recognition FSM: one update per complete sensor frame ----
 typedef enum { MARK_IDLE, MARK_ACCUM } MarkFsmState_t;
 
 static volatile MarkFsmState_t markFsmState = MARK_IDLE;
-static volatile uint32_t markMs = 0;          // 프레임(=1ms) 카운터
-static volatile uint32_t markStartMs = 0;
-static volatile uint32_t markLastEndMs = 0;
+static volatile uint32_t markElapsedUs = 0;
+static volatile uint32_t markStartUs = 0;
+static volatile uint32_t markLastEndUs = 0;
+static volatile uint8_t  markHasLastEnd = 0;
 static volatile uint8_t  markPending = 0;     // 소비 대기중인 확정 마커
 static volatile MarkType_t markPendingType = MARKTYPE_LEFT;
 static volatile uint8_t  markAccum = 0;
+/* Centre samples are not trustworthy while a marker/cross crosses the array.
+ * Classification and the MARK_GAP_US filter stay independent from this flag. */
+static volatile uint8_t markerTrackingActive = 0;
+/* The eight sensors are scanned serially.  Preserve a very short history of
+ * the middle sensors so a fast cross is not required to light all of them in
+ * the same reconstructed frame. */
+static volatile uint8_t markMiddleHistory[MARK_PRETRIGGER_FRAMES];
+static volatile uint8_t markMiddleHistoryIndex = 0;
+
+/* ★교차로를 비스듬히 밟으면 오른쪽 팔과 왼쪽 팔이 시간차를 두고 보인다.★
+ *   센서가 잠깐 꺼졌다고 바로 마커를 확정해버리면 RIGHT 하나 + LEFT 하나,
+ *   즉 가짜 마커 두 개가 생기고 구간 상태기계가 통째로 뒤집힌다.
+ *   꺼진 뒤에도 이 시간만큼은 같은 마커로 보고 계속 누적한다.
+ *   기준은 "시간"이 아니라 ★거리★다. 속도가 변해도 판정이 안 변해야 한다 */
+static volatile uint32_t markLastActiveUs = 0;
+static volatile uint32_t markReleaseUs = MARK_MERGE_US_DEFAULT;
+/* 마커를 "확정한" 위치가 아니라 "시작한" 위치를 기록해야 지도가 정확하다.
+ * 병합창만큼 확정이 늦어지는데, 그 사이에도 로봇은 계속 달린다 */
+static volatile int32_t markStartDistMm = 0;
+static volatile int32_t markPendingDistMm = 0;
+
+/* 주행 루프가 속도를 바꿀 때마다 불러준다 (mm/s) */
+void Mark_Set_Speed(int32_t v_mm_s) {
+	float v = (float) ((v_mm_s < 0) ? -v_mm_s : v_mm_s);
+	uint32_t us;
+
+	if (v < 50.0f)
+		v = 50.0f;
+
+	us = (uint32_t) (MARK_MERGE_MM * 1000000.0f / v);
+	if (us < MARK_MERGE_US_MIN)
+		us = MARK_MERGE_US_MIN;
+	else if (us > MARK_MERGE_US_MAX)
+		us = MARK_MERGE_US_MAX;
+
+	markReleaseUs = us;
+}
 
 __STATIC_INLINE void IR_Enable(uint8_t idx) {
 	HAL_GPIO_WritePin((IR_Index + idx)->Port, (IR_Index + idx)->Pin,
@@ -115,21 +162,52 @@ __STATIC_INLINE void IR_Disable(uint8_t idx) {
 			GPIO_PIN_RESET);
 }
 
-/* 한 프레임(8슬롯) 완성될 때마다 ISR에서 호출된다. 호출주기 = 1ms */
+static uint8_t Mark_Middle_History_Or(void) {
+	uint8_t middle = 0;
+	for (uint8_t i = 0; i < MARK_PRETRIGGER_FRAMES; i++)
+		middle |= markMiddleHistory[i];
+	return middle;
+}
+
+static void Mark_Middle_History_Push(uint8_t st) {
+	markMiddleHistory[markMiddleHistoryIndex] = (uint8_t) (st & 0x7Eu);
+	markMiddleHistoryIndex = (uint8_t) ((markMiddleHistoryIndex + 1u)
+			% MARK_PRETRIGGER_FRAMES);
+}
+
+/* Called after each complete 8-slot frame (2 ms with the current TIM6 setup). */
 static void Mark_FSM_Step(uint8_t st) {
 	/* 양 끝단 센서(0번, 7번) 중 하나라도 감지되었는가? */
 	uint8_t edge = (uint8_t) (st & 0x81);
+	uint8_t middleWide = (uint8_t) (__builtin_popcount(
+			(unsigned int) (st & 0x7E)) >= MARK_CROSS_MIDDLE_MIN);
+	uint8_t active = (uint8_t) ((edge != 0u) || (middleWide != 0u));
+	uint8_t previousMiddle = Mark_Middle_History_Or();
+	Mark_Middle_History_Push(st);
+	/* Only the dedicated outer marker sensors may mask steering.  A normal
+	 * tight curve can illuminate four middle line sensors, which is useful
+	 * evidence for CROSS classification but must never freeze line tracking. */
+	markerTrackingActive = (uint8_t) (edge != 0u);
 
-	markMs++;
+	markElapsedUs += SENSOR_FRAME_PERIOD_US;
 
 	if (markFsmState == MARK_IDLE) {
-		if (edge) {
+		/* A cross is seen by the middle sensors before its outer ends.
+		 * Collect that wide pattern too; otherwise slow driving can discard
+		 * it before both outer sensors are observed and report END. */
+		if (active) {
 			/* 직전 확정으로부터 너무 붙어 있으면 채터링이다 */
-			if ((markMs - markLastEndMs) < MARK_GAP_MIN_MS)
+			if (markHasLastEnd
+					&& (markElapsedUs - markLastEndUs) < MARK_GAP_US)
 				return;
 			markFsmState = MARK_ACCUM;
-			markStartMs = markMs;
-			markAccum = st;
+			markStartUs = markElapsedUs;
+			markLastActiveUs = markElapsedUs;
+			markStartDistMm = Distance_Get_Mm();
+			/* The marker ends may be seen after the centre of a fast cross.
+			 * Seed the event with only the preceding middle-sensor evidence;
+			 * old edge bits must never create a false marker. */
+			markAccum = (uint8_t) (st | previousMiddle);
 		}
 		return;
 	}
@@ -137,28 +215,43 @@ static void Mark_FSM_Step(uint8_t st) {
 	/* 1. 마커센서가 켜지면 거기부터 누적한다. */
 	markAccum |= st;
 
-	if (!edge) {
-		uint32_t width = markMs - markStartMs;
+	if (active) {
+		markLastActiveUs = markElapsedUs;
+		return;
+	}
+
+	/* ★꺼졌다고 바로 닫지 않는다.★ 병합창 안에서 다시 켜지면 같은 마커다.
+	 *   교차로를 비스듬히 밟은 경우가 여기서 하나로 이어붙는다 */
+	if ((markElapsedUs - markLastActiveUs) < markReleaseUs)
+		return;
+
+	{
+		uint32_t width = markLastActiveUs - markStartUs;
 
 		markFsmState = MARK_IDLE;
-		markLastEndMs = markMs;
 
-		if (width < MARK_MIN_MS)
+		if (width < MARK_MIN_WIDTH_US)
 			return;                       // 폭 미달 → 글리치, 버린다
+
+		/* A broad ordinary curve can excite the middle sensors.  It is not a
+		 * marker unless at least one outer sensor participated. */
+		if ((markAccum & 0x81u) == 0u)
+			return;
+
+		markLastEndUs = markLastActiveUs;
+		markHasLastEnd = 1;
+		markPendingDistMm = markStartDistMm;   /* 확정 위치가 아니라 시작 위치 */
 
 		/* 3. 마커 두개가 다 켜졌으면 */
 		if ((markAccum & 0x81) == 0x81) {
-			/* ★ 전체 개수가 아니라 ★가운데 라인센서(bit1~6)★ 개수로 가른다.
-			 *   CROSS = 라인을 가로지르는 선 → 가운데가 전부 흰색이 된다
-			 *   END   = 양옆에만 마커        → 가운데는 라인 위 1~2개뿐
-			 *   전체(0~7)로 세면 END에서도 마커2 + 라인2 + 흔들림2 = 6이 나와서
-			 *   구분이 안 됐다. 0x7E = bit1~bit6 만 남기는 마스크 */
-			if (__builtin_popcount(markAccum & 0x7E) >= 5) {
+			/* Both ends plus four-or-more centre sensors is a cross. */
+			if (__builtin_popcount((unsigned int) (markAccum & 0x7E))
+					>= MARK_CROSS_MIDDLE_MIN) {
 				markPendingType = MARKTYPE_CROSS;
 			} else {
 				markPendingType = MARKTYPE_END;
 			}
-		}
+		} 
 		/* 2. 마커가 끝났을때 왼쪽만 켜졌으면 left 반대는 right다. */
 		else if (markAccum & 0x80) {
 			markPendingType = MARKTYPE_RIGHT;  /* bit7 = 오른쪽 끝 센서 */
@@ -226,15 +319,25 @@ void SENSOR_IRQ_Handler() {
 			irData.sensorState &= (uint8_t) ~(1u << idx);
 	}
 
-	/* 8슬롯 한 바퀴 = 1ms. 여기서 마커 FSM을 돌리면
-	 * 주행루프의 LCD 블로킹과 무관하게 판정주기가 1kHz로 고정된다 */
-	if (idx == (SENSOR_NUM - 1))
-	{
-		Sensor_Update_Position();     /* ★위치·변화량을 여기서 확정한다★ */
+	/* 8슬롯 한 바퀴 = 2ms. 여기서 마커 FSM을 돌리면
+	 * 주행루프의 LCD 블로킹과 무관하게 판정주기가 500Hz로 고정된다 */
+	if (idx == (SENSOR_NUM - 1)) {
 		Mark_FSM_Step(irData.sensorState);
+		/* ★8슬롯 한 바퀴 완성. 제어기가 이 신호를 보고 PD를 갱신한다★
+		 *   HAL_GetTick 으로 2ms를 세면 센서 갱신과 어긋나서
+		 *   어떤 주기는 새 값이 없고 어떤 주기는 두 번 밀린다 */
+		sensorFrameReady = 1;
 	}
 
 	irData.index = (irData.index + 1) & 0x07;
+}
+
+/* 새 프레임이 있으면 1을 돌려주고 플래그를 지운다 (한 번만 소비) */
+uint8_t Sensor_Take_Frame(void) {
+	if (!sensorFrameReady)
+		return 0;
+	sensorFrameReady = 0;
+	return 1;
 }
 
 void Sensor_Start() {
@@ -283,15 +386,8 @@ uint8_t Sensor_Line_Found() {
 	return lineFound;
 }
 
-/* ★ 주행 시작 전에 반드시 부른다.
- *   라인을 놓치면 linePosition을 "직전 값 그대로" 유지하는 구조라,
- *   초기화를 안 하면 지난 주행에서 이탈한 방향이 그대로 남아 있다가
- *   출발하자마자 그쪽으로 확 꺾어버린다 */
-void Sensor_Reset_Line(void) {
-	linePosition = 0;
-	lineFound = 0;
-	lineDelta = 0;
-	linePrev = 0;
+uint8_t Sensor_Marker_Active() {
+	return markerTrackingActive;
 }
 
 void Sensor_Calibration() {
@@ -455,9 +551,7 @@ void Sensor_Test_Normalized() {
 }
 
 
-/* ★ADC ISR 안에서 8슬롯 한 바퀴 끝날 때마다 호출된다 (1kHz 고정).
- *   예전엔 주행루프가 불규칙하게 불렀다 — 그래서 D를 못 썼다 */
-static void Sensor_Update_Position(void) {
+int32_t Sensor_Get_Position() {
 	int32_t sum_pw = 0;
 	int32_t sum_w = 0;
 
@@ -484,29 +578,32 @@ static void Sensor_Update_Position(void) {
 		lineFound = 0;   // 직전 linePosition 유지 (마지막 방향으로 계속 꺾음)
 	}
 
-	/* 1ms 동안의 변화량. 라인을 놓친 동안은 0으로 둔다
-	 * (직전값을 유지하니 차분이 0이 되는 게 맞다) */
-	lineDelta = linePosition - linePrev;
-	linePrev = linePosition;
-}
-
-int32_t Sensor_Get_Position(void) {
 	return linePosition;
-}
-
-int32_t Sensor_Get_Delta(void) {
-	return lineDelta;
 }
 
 void Mark_FSM_Reset() {
 	__disable_irq();
 	markFsmState = MARK_IDLE;
-	markMs = 0;
-	markStartMs = 0;
-	markLastEndMs = 0;
+	markElapsedUs = 0;
+	markStartUs = 0;
+	markLastEndUs = 0;
+	markHasLastEnd = 0;
 	markAccum = 0;
+	markerTrackingActive = 0;
+	markLastActiveUs = 0;
+	markStartDistMm = 0;
+	markPendingDistMm = 0;
+	for (uint8_t i = 0; i < MARK_PRETRIGGER_FRAMES; i++)
+		markMiddleHistory[i] = 0;
+	markMiddleHistoryIndex = 0;
 	markPending = 0;
 	__enable_irq();
+}
+
+/* ★마커가 시작된 지점의 주행거리.★  Mark_Consume 이 1을 준 직후에만 유효하다.
+ *   병합창 때문에 확정이 수십 ms 늦으므로, 지도에는 이 값을 써야 한다 */
+int32_t Mark_Get_Dist_Mm(void) {
+	return markPendingDistMm;
 }
 
 uint8_t Mark_Consume(MarkType_t *outType) {
@@ -541,13 +638,14 @@ void Sensor_Test_State() {
 		UserInput_t btn_input = Button_Get_Input();
 		uint32_t now = HAL_GetTick();
 
-		/* ★ L / R 로 흰색/검정 판정 문턱(threshold)을 그 자리에서 바꾼다.
-		 *   8칸 박스가 즉시 반응하므로 눈으로 보면서 확정할 수 있다 */
+		/* ★ L / R 로 흰색/검정 판정 문턱을 그 자리에서 바꾼다.
+		 *   8칸 박스가 즉시 반응하니 눈으로 보면서 확정할 수 있다 */
 		if (btn_input == INPUT_CMD_L_SINGLE || btn_input == INPUT_CMD_L_HOLD) {
 			if (irData.sensorThreshold > SENSOR_THR_MIN)
 				irData.sensorThreshold--;
 			lastDraw = 0;
-		} else if (btn_input == INPUT_CMD_R_SINGLE || btn_input == INPUT_CMD_R_HOLD) {
+		} else if (btn_input == INPUT_CMD_R_SINGLE
+				|| btn_input == INPUT_CMD_R_HOLD) {
 			if (irData.sensorThreshold < SENSOR_THR_MAX)
 				irData.sensorThreshold++;
 			lastDraw = 0;
@@ -568,7 +666,7 @@ void Sensor_Test_State() {
 
 			Sensor_Snapshot(buf, irData.sensorNormalized);
 			UI_Sensor_Cells(buf, 100, irData.sensorState, Sensor_Valid_Mask(), 1);
-			UI_Sensor_Pos(p, SENSOR_POS_MAX);
+			UI_Sensor_Pos(p, 3700);
 			UI_Sensor_Status(Sensor_Line_Found(), markName);
 			UI_Badge_Int("thr", irData.sensorThreshold, UI_C_ACCENT);
 		}
